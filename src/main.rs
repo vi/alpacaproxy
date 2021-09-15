@@ -132,7 +132,10 @@ async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db) -> an
                 }
                 "monitor" => {
                     log::info!("  streaming messages for the client");
-                    while let Some(evt) = db.watch_prefix(vec![]).await {
+                    let mut watcher = db.watch_prefix(vec![]);
+                    
+                    // https://github.com/spacejam/sled/issues/1368
+                    while let Some(evt) = (&mut watcher).await {
                         match evt {
                             sled::Event::Insert { key, value } => {
                                 let key : Result<[u8; 8], _> = key.as_ref().try_into();
@@ -148,6 +151,33 @@ async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db) -> an
                     }
                     log::debug!("  streaming messages finished");
                 }
+                "remove_retaining_last_n" => {
+                    let num = match msg.data {
+                        serde_json::Value::Number(x) => x.as_u64().context("Cannot handle nubmer of remove_retaining_last_n messages")?,
+                        _ => {
+                            client_sink = err_to_client(client_sink, "Invalid type of `data` for `remove_retaining_last_n` message, expected a number".to_owned()).await?;
+                            return Ok(client_sink)
+                        }
+                    };
+                    log::info!("  retaining {} last samples in the database", num);
+                    let first = (0u64).to_be_bytes();
+                    let last = cursor.saturating_sub(num).to_be_bytes();
+                    let mut ctr = 0u64;
+                    for x in db.range(first..last) {
+                        if let Ok((key, _val)) = x {
+                            match db.remove(&key) {
+                                Err(e) => log::error!("Error removing entry {:?}: {}", key, e),
+                                Ok(None) => (),
+                                Ok(Some(_)) => ctr += 1,
+                            }
+                        }
+                    }
+                    {
+                        let buf = serde_json::to_string(&Message{stream:"remove_finished".to_owned(), data: serde_json::Value::Number(ctr.into())}).unwrap();
+                        client_sink.send(WebsocketMessage::Text(buf)).await?;
+                    }
+                    log::info!("  finished removing {} entries", ctr);
+                }
                 x => {
                     client_sink = err_to_client(client_sink, format!("Unknown command type {}", x)).await?;
                 }
@@ -162,15 +192,15 @@ async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db) -> an
             Ok(WebsocketMessage::Text(msg)) => client_sink = handle_msg(serde_json::from_str(&msg)?, client_sink).await?,
             Ok(WebsocketMessage::Binary(msg)) => client_sink = handle_msg(serde_json::from_slice(&msg)?, client_sink).await?,
             Ok(WebsocketMessage::Close(c)) => {
-                log::warn!("Close message from upstream: {:?}", c);
+                log::info!("Close message from client: {:?}", c);
             }
             Ok(WebsocketMessage::Ping(_)) => {
-                log::debug!("WebSocket ping from upstream");
+                log::debug!("WebSocket ping from client");
             }
             Ok(_) => {
-                log::warn!("other WebSocket message from upstream");
+                log::warn!("other WebSocket message from client");
             }
-            Err(e) => log::error!("From upstream websocket: {}", e),
+            Err(e) => log::error!("From client websocket: {}", e),
         }
     }
     Ok(())
@@ -231,10 +261,18 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let opts : Opts = argh::from_env();
     let db = sled::open(opts.database)?;
+    log::debug!("Opened the database");
+    if db.was_recovered() {
+        log::warn!("Database was recovered");
+    }
 
     let config : ClientConfig = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(opts.client_config)?))?;
 
+    log::debug!("Processed config file");
+
     let listener = tokio::net::TcpListener::bind(opts.listen_addr).await?;
+
+    log::debug!("Created listening socket");
 
     let db_ = db.clone();
     tokio::spawn(async move {
