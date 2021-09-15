@@ -57,10 +57,10 @@ fn get_next_db_key(db: &sled::Db) -> anyhow::Result<u64> {
     Ok(nextkey)
 }
 
-async fn serve_client(mut client_socket: tokio::net::TcpStream, db: &sled::Db) -> anyhow::Result<()> {
+async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db) -> anyhow::Result<()> {
     let (mut client_sink, mut client_stream) = tokio_tungstenite::accept_async(client_socket).await?.split();
     {
-        let mut buf = serde_json::to_string(&Message{stream:"hello".to_owned(), data: serde_json::Value::Null}).unwrap();
+        let buf = serde_json::to_string(&Message{stream:"hello".to_owned(), data: serde_json::Value::Null}).unwrap();
         client_sink.send(WebsocketMessage::Text(buf)).await?;
     }
     let mut cursor = get_next_db_key(db)?;
@@ -72,6 +72,42 @@ async fn serve_client(mut client_socket: tokio::net::TcpStream, db: &sled::Db) -
             let ret : anyhow::Result<_> = Ok(client_sink);
             ret
         }  
+    };
+
+    let datum_to_client = |v: sled::IVec, mut client_sink:  SplitSink<_,_>, id: u64| -> _ {
+        async move {
+            let minutely : MinutelyData = match serde_json::from_slice(&v) {
+                Ok(x) => x,
+                Err(_e) => {
+                    log::warn!("Failed to properly deserialize minutely datum number {}", id);
+                    return Ok(client_sink);
+                }
+            };
+            let stream = format!("{}.{}", minutely.ev, minutely.t);
+            let msg = Message {
+                stream,
+                data: serde_json::to_value(minutely)?,
+            };
+            client_sink.send(WebsocketMessage::Text(serde_json::to_string(&msg)?)).await?;
+            let ret : anyhow::Result<_> = Ok(client_sink);
+            ret 
+        }
+    };
+
+    let preroller = |mut client_sink:  SplitSink<_,_>, range: _| -> _ {
+        async move {
+            for x in range {
+                let x : u64 = x;
+                match db.get(x.to_be_bytes())? {
+                    Some(v) => {
+                        client_sink = datum_to_client(v, client_sink, x).await?;
+                    }
+                    None => log::warn!("Missing datum number {}", x),
+                }
+            }
+            let ret : anyhow::Result<_> = Ok(client_sink);
+            ret 
+        }
     };
 
     let handle_msg = |msg: Message, mut client_sink:  SplitSink<_,_>| -> _ {
@@ -87,27 +123,30 @@ async fn serve_client(mut client_socket: tokio::net::TcpStream, db: &sled::Db) -
                     };
                     log::info!("  prerolling {} messages for the client", num);
                     let start = cursor.saturating_sub(num);
-                    for x in start..cursor {
-                        match db.get(x.to_be_bytes())? {
-                            Some(v) => {
-                                let minutely : MinutelyData = match serde_json::from_slice(&v) {
-                                    Ok(x) => x,
-                                    Err(_e) => {
-                                        log::warn!("Failed to properly deserialize minutely datum number {}", x);
-                                        continue
-                                    }
-                                };
-                                let stream = format!("{}.{}", minutely.ev, minutely.t);
-                                let msg = Message {
-                                    stream,
-                                    data: serde_json::to_value(minutely)?,
-                                };
-                                client_sink.send(WebsocketMessage::Text(serde_json::to_string(&msg)?)).await?;
+                    client_sink = preroller(client_sink, start..cursor).await?;
+                    {
+                        let buf = serde_json::to_string(&Message{stream:"preroll_finished".to_owned(), data: serde_json::Value::Null}).unwrap();
+                        client_sink.send(WebsocketMessage::Text(buf)).await?;
+                    }
+                    log::debug!("  prerolling finished");
+                }
+                "monitor" => {
+                    log::info!("  streaming messages for the client");
+                    while let Some(evt) = db.watch_prefix(vec![]).await {
+                        match evt {
+                            sled::Event::Insert { key, value } => {
+                                let key : Result<[u8; 8], _> = key.as_ref().try_into();
+                                if let Ok(key) = key {
+                                    let key = u64::from_be_bytes(key);
+                                    client_sink = preroller(client_sink, cursor..key).await?;
+                                    client_sink = datum_to_client(value, client_sink, key).await?;
+                                    cursor = key.saturating_add(1);
+                                }
                             }
-                            None => log::warn!("Missing datum number {}", x),
+                            sled::Event::Remove { key:_ } => (),
                         }
                     }
-                    log::info!("  prerolling finished");
+                    log::debug!("  streaming messages finished");
                 }
                 x => {
                     client_sink = err_to_client(client_sink, format!("Unknown command type {}", x)).await?;
@@ -227,6 +266,5 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
      
-
-    Ok(())
+    //Ok(())
 }
