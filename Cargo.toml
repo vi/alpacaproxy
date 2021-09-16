@@ -16,7 +16,7 @@ log = "0.4.14"
 serde = "1.0.130"
 serde_derive = "1.0.130"
 serde_json = "1.0.67"
-sled = "0.34.6"
+sled = {version="0.34.6", features=["compression"]}
 tokio = {version="1.11.0", features=["macros","rt","time","sync", "net", "io-util"]}
 tokio-tungstenite = {version="0.15.0", features=["rustls-tls"]}
 

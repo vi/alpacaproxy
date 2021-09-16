@@ -256,17 +256,28 @@ async fn handle_upstream(config: &ClientConfig, db: &sled::Db) -> anyhow::Result
     Ok(())
 }
 
-#[tokio::main(flavor="current_thread")]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let opts : Opts = argh::from_env();
-    let db = sled::open(opts.database)?;
+    let opts: Opts = argh::from_env();
+    let db = sled::Config::default()
+        .cache_capacity(1024 * 1024)
+        .use_compression(true)
+        .compression_factor(1)
+        .path(opts.database)
+        .open()?;
     log::debug!("Opened the database");
     if db.was_recovered() {
         log::warn!("Database was recovered");
     }
 
-    let config : ClientConfig = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(opts.client_config)?))?;
+    let config: Option<ClientConfig> = if opts.client_config.as_os_str().to_string_lossy() == "." {
+        None
+    } else {
+        Some(serde_json::from_reader(std::io::BufReader::new(
+            std::fs::File::open(opts.client_config)?,
+        ))?)
+    };
 
     log::debug!("Processed config file");
 
@@ -296,13 +307,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    loop {
-        if let Err(e) = handle_upstream(&config, &db).await {
-            log::error!("Handling upstream connection existed with error: {}", e);
+    if let Some(config) = config {
+        loop {
+            if let Err(e) = handle_upstream(&config, &db).await {
+                log::error!("Handling upstream connection existed with error: {}", e);
+            }
+            log::info!("Finished upstream connection");
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
-        log::info!("Finished upstream connection");
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+    } else {
+        log::warn!("Not using any upstream, just waiting endlessly");
+        futures::future::pending::<()>().await;
+        Ok(())
     }
-     
-    //Ok(())
+
 }
