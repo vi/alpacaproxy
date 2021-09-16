@@ -2,7 +2,6 @@ use std::convert::TryInto;
 use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
-use futures::stream::SplitSink;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::time::Duration;
 
@@ -243,6 +242,29 @@ impl ServeClient {
                 })
                 .unwrap();
                 self.ws.send(WebsocketMessage::Text(buf)).await?;
+            }
+            "filter" => {
+                match msg.data {
+                    serde_json::Value::Array(a) => {
+                        let mut f : hashbrown::HashSet<smol_str::SmolStr> = hashbrown::HashSet::with_capacity(a.len());
+                        for x in a {
+                            match x {
+                                serde_json::Value::String(s) => {
+                                    f.insert(smol_str::SmolStr::new(s));
+                                }
+                                _ => {
+                                    self.err("Invalid type of `data`'s element for `filter` message, expected a string".to_owned()).await?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        self.filter = Some(f);
+                    }
+                    _ => {
+                        self.err("Invalid type of `data` for `filter` message, expected an array".to_owned()).await?;
+                        return Ok(());
+                    }
+                };
             }
             x => {
                 self.err(format!("Unknown command type {}", x)).await?;
