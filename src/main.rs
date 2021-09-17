@@ -26,6 +26,18 @@ struct Message {
     data: serde_json::Value,
 }
 
+
+#[derive(serde_derive::Deserialize)]
+#[serde(tag = "stream", content = "data")]
+#[serde(rename_all = "snake_case")]
+enum ControlMessage {
+    Preroll(u64),
+    Monitor,
+    Filter(Vec<String>),
+    RemoveRetainingLastN(u64),
+    DatabaseSize,
+}
+
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 struct MinutelyData {
     ev: String,
@@ -77,23 +89,44 @@ impl ServeClient {
         }
 
         while let Some(msg) = self.ws.next().await {
-            match msg {
+            let cmsg: ControlMessage = match msg {
                 Ok(WebsocketMessage::Text(msg)) => {
-                    self.handle_msg(serde_json::from_str(&msg)?).await?
+                    match serde_json::from_str(&msg) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            self.err(e.to_string()).await?;
+                            continue;
+                        }
+                    }
                 }
                 Ok(WebsocketMessage::Binary(msg)) => {
-                    self.handle_msg(serde_json::from_slice(&msg)?).await?
+                    match serde_json::from_slice(&msg) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            self.err(e.to_string()).await?;
+                            continue;
+                        }
+                    }
                 }
                 Ok(WebsocketMessage::Close(c)) => {
                     log::info!("Close message from client: {:?}", c);
+                    break;
                 }
                 Ok(WebsocketMessage::Ping(_)) => {
                     log::debug!("WebSocket ping from client");
+                    continue;
                 }
                 Ok(_) => {
                     log::warn!("other WebSocket message from client");
+                    continue;
                 }
-                Err(e) => log::error!("From client websocket: {}", e),
+                Err(e) => {
+                    log::error!("From client websocket: {}", e);
+                    continue;
+                }
+            };
+            if let Err(e) = self.handle_msg(cmsg).await {
+                self.err(e.to_string()).await?;
             }
         }
         Ok(())
@@ -152,22 +185,9 @@ impl ServeClient {
         Ok(())
     }
 
-    async fn handle_msg(&mut self, msg: Message) -> anyhow::Result<()> {
-        match &msg.stream[..] {
-            "preroll" => {
-                let num = match msg.data {
-                    serde_json::Value::Number(x) => x
-                        .as_u64()
-                        .context("Cannot handle nubmer of preroll messages")?,
-                    _ => {
-                        self.err(
-                            "Invalid type of `data` for `preroll` message, expected a number"
-                                .to_owned(),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
+    async fn handle_msg(&mut self, msg: ControlMessage) -> anyhow::Result<()> {
+        match msg {
+            ControlMessage::Preroll(num) => {
                 log::info!("  prerolling {} messages for the client", num);
                 let start = self.cursor.saturating_sub(num);
                 self.preroller(start..self.cursor).await?;
@@ -181,7 +201,7 @@ impl ServeClient {
                 }
                 log::debug!("  prerolling finished");
             }
-            "monitor" => {
+            ControlMessage::Monitor => {
                 log::info!("  streaming messages for the client");
                 let mut watcher = self.db.watch_prefix(vec![]);
 
@@ -202,16 +222,7 @@ impl ServeClient {
                 }
                 log::debug!("  streaming messages finished");
             }
-            "remove_retaining_last_n" => {
-                let num = match msg.data {
-                    serde_json::Value::Number(x) => x
-                        .as_u64()
-                        .context("Cannot handle nubmer of remove_retaining_last_n messages")?,
-                    _ => {
-                        self.err("Invalid type of `data` for `remove_retaining_last_n` message, expected a number".to_owned()).await?;
-                        return Ok(());
-                    }
-                };
+            ControlMessage::RemoveRetainingLastN(num) => {
                 log::info!("  retaining {} last samples in the database", num);
                 let first = (0u64).to_be_bytes();
                 let last = self.cursor.saturating_sub(num).to_be_bytes();
@@ -235,7 +246,7 @@ impl ServeClient {
                 }
                 log::info!("  finished removing {} entries", ctr);
             }
-            "database_size" => {
+            ControlMessage::DatabaseSize => {
                 let buf = serde_json::to_string(&Message {
                     stream: "database_size".to_owned(),
                     data: serde_json::Value::Number(self.db.size_on_disk()?.into()),
@@ -243,31 +254,8 @@ impl ServeClient {
                 .unwrap();
                 self.ws.send(WebsocketMessage::Text(buf)).await?;
             }
-            "filter" => {
-                match msg.data {
-                    serde_json::Value::Array(a) => {
-                        let mut f : hashbrown::HashSet<smol_str::SmolStr> = hashbrown::HashSet::with_capacity(a.len());
-                        for x in a {
-                            match x {
-                                serde_json::Value::String(s) => {
-                                    f.insert(smol_str::SmolStr::new(s));
-                                }
-                                _ => {
-                                    self.err("Invalid type of `data`'s element for `filter` message, expected a string".to_owned()).await?;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        self.filter = Some(f);
-                    }
-                    _ => {
-                        self.err("Invalid type of `data` for `filter` message, expected an array".to_owned()).await?;
-                        return Ok(());
-                    }
-                };
-            }
-            x => {
-                self.err(format!("Unknown command type {}", x)).await?;
+            ControlMessage::Filter(a) => {
+                self.filter = Some(a.into_iter().map(smol_str::SmolStr::new).collect());
             }
         }
         Ok(())
