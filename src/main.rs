@@ -38,6 +38,7 @@ enum UpstreamStatus {
     Paused,
     Connecting,
     Connected,
+    Mirroring,
 }
 
 #[derive(serde_derive::Serialize, Debug)]
@@ -543,6 +544,7 @@ impl UpstreamStats {
                 .await?;
         }
         if automirror {
+            self.0.lock().unwrap().status = UpstreamStatus::Mirroring;
             let cursor = match get_first_last_id(db)? {
                 (_, Some(x)) => x+1,
                 _ => 0,
@@ -578,10 +580,15 @@ impl UpstreamStats {
                 }
                 "preroll_finished" => {
                     log::debug!("Received 'preroll_finished' response");
+                    if automirror {
+                        self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                    }
                 }
                 "hello" => {
                     log::info!("Established upstream connection with a proxy");
-                    self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                    if !automirror {
+                        self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                    }
                 }
                 x if x.starts_with("AM.") => {
                     log::debug!("Received minutely update for {}", x);
