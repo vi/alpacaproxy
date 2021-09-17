@@ -31,22 +31,6 @@ struct Message {
     data: serde_json::Value,
 }
 
-#[derive(serde_derive::Deserialize)]
-#[serde(tag = "stream", content = "data")]
-#[serde(rename_all = "snake_case")]
-enum ControlMessage {
-    Preroll(u64),
-    Monitor,
-    Filter(Vec<String>),
-    RemoveRetainingLastN(u64),
-    DatabaseSize,
-    Status,
-    Shutdown,
-    PauseUpstream,
-    ResumeUpstream,
-    CursorToSpecificId(u64),
-}
-
 #[derive(serde_derive::Serialize, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
 enum UpstreamStatus {
@@ -126,6 +110,22 @@ fn get_first_last_id(db: &sled::Db) -> anyhow::Result<(Option<u64>,Option<u64>)>
     Ok((firstkey, lastkey))
 }
 
+#[derive(serde_derive::Deserialize)]
+#[serde(tag = "stream", content = "data")]
+#[serde(rename_all = "snake_case")]
+enum ControlMessage {
+    Preroll(u64),
+    Monitor,
+    Filter(Vec<String>),
+    RemoveRetainingLastN(u64),
+    DatabaseSize,
+    Status,
+    Shutdown,
+    PauseUpstream,
+    ResumeUpstream,
+    CursorToSpecificId(u64),
+    Password(String),
+}
 
 
 struct ServeClient {
@@ -134,7 +134,27 @@ struct ServeClient {
     cursor: u64,
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
     console_control: Sender<ConsoleControl>,
+    require_password: Option<String>
 }
+
+async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db, console_control: Sender<ConsoleControl>, require_password: Option<String>) -> anyhow::Result<()> {
+    let ws = tokio_tungstenite::accept_async(client_socket).await?;
+    let cursor = get_next_db_key(db)?;
+    let cc2 = console_control.clone();
+    let c = ServeClient {
+        ws,
+        db: db.clone(),
+        cursor,
+        filter: None,
+        console_control,
+        require_password,
+    };
+    let _ = cc2.send(ConsoleControl::ClientConnected).await;
+    let ret = c.run().await;
+    let _ = cc2.send(ConsoleControl::ClientDisconnected).await;
+    ret
+}
+
 
 impl ServeClient {
     async fn run(mut self) -> anyhow::Result<()> {
@@ -242,6 +262,10 @@ impl ServeClient {
     }
 
     async fn handle_msg(&mut self, msg: ControlMessage) -> anyhow::Result<()> {
+        if self.require_password.is_some() && ! matches!(msg, ControlMessage::Password(..)) {
+            self.err("Supply a password first".to_owned()).await?;
+            return Ok(());
+        }
         match msg {
             ControlMessage::Preroll(num) => {
                 log::info!("  prerolling {} messages for the client", num);
@@ -329,26 +353,22 @@ impl ServeClient {
             ControlMessage::PauseUpstream => self.console_control.send(ConsoleControl::PauseUpstream).await?,
             ControlMessage::ResumeUpstream => self.console_control.send(ConsoleControl::ResumeUpstream).await?,
             ControlMessage::CursorToSpecificId(newid) => self.cursor = newid,
+            ControlMessage::Password(supplied_password) => {
+                if let Some(required_password) = self.require_password.take() {
+                    if required_password != supplied_password {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        self.err("Invalid password".to_owned()).await?;
+                        self.require_password = Some(required_password);
+                    } else {
+                        // `take` above removed the gate
+                    }
+                } else {
+                    self.err("No password required".to_owned()).await?;
+                }
+            }
         }
         Ok(())
     }
-}
-
-async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db, console_control: Sender<ConsoleControl>) -> anyhow::Result<()> {
-    let ws = tokio_tungstenite::accept_async(client_socket).await?;
-    let cursor = get_next_db_key(db)?;
-    let cc2 = console_control.clone();
-    let c = ServeClient {
-        ws,
-        db: db.clone(),
-        cursor,
-        filter: None,
-        console_control,
-    };
-    let _ = cc2.send(ConsoleControl::ClientConnected).await;
-    let ret = c.run().await;
-    let _ = cc2.send(ConsoleControl::ClientDisconnected).await;
-    ret
 }
 
 pub struct UpstreamStatsBuffer {
@@ -508,7 +528,7 @@ impl UpstreamStats {
     }
 }
 
-async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender<ConsoleControl>) -> anyhow::Result<()> {
+async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender<ConsoleControl>, require_password: Option<String>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     log::debug!("Created listening socket");
@@ -519,8 +539,9 @@ async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender
                 log::info!("Incoming client connection from {}", addr);
                 let db__ = db.clone();
                 let consctrl = console.clone();
+                let require_password = require_password.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_client(client_socket, &db__, consctrl).await {
+                    if let Err(e) = serve_client(client_socket, &db__, consctrl, require_password).await {
                         log::error!("Error serving client: {}", e);
                     }
                     log::info!("Finished serving client from {}", addr);
@@ -545,7 +566,7 @@ fn main() -> anyhow::Result<()> {
 
     let opts: Opts = argh::from_env();
 
-    let _ = read_config(&opts.client_config)?;
+    let first_config = read_config(&opts.client_config)?;
     log::debug!("Checked config file");
 
 
@@ -569,7 +590,7 @@ fn main() -> anyhow::Result<()> {
     let db_ = db.clone();
     let listen_addr = opts.listen_addr;
     rt.spawn(async move {
-        if let Err(e) = socket_listener(listen_addr, &db_, tx).await {
+        if let Err(e) = socket_listener(listen_addr, &db_, tx, first_config.require_password).await {
             log::error!("Socket listener: {}", e);
         }
     });
