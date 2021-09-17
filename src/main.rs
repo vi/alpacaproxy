@@ -6,6 +6,7 @@ use anyhow::Context;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
+#[allow(unused_imports)]
 use tokio::sync::oneshot::{Receiver as OneshotReceiver, Sender as OneshotSender};
 use tokio::time::Instant;
 
@@ -39,7 +40,10 @@ enum ControlMessage {
     Filter(Vec<String>),
     RemoveRetainingLastN(u64),
     DatabaseSize,
-    Stats,
+    Status,
+    Shutdown,
+    PauseUpstream,
+    ResumeUpstream,
 }
 
 #[derive(serde_derive::Serialize, Clone, Copy, Debug)]
@@ -306,7 +310,7 @@ impl ServeClient {
             ControlMessage::Filter(a) => {
                 self.filter = Some(a.into_iter().map(smol_str::SmolStr::new).collect());
             }
-            ControlMessage::Stats => {
+            ControlMessage::Status => {
                 let (tx,rx) = tokio::sync::oneshot::channel();
                 self.console_control.send(ConsoleControl::Status(tx)).await?;
                 let ss = rx.await?;
@@ -315,6 +319,9 @@ impl ServeClient {
                     data: serde_json::to_value(ss)?,
                 })?)).await?;
             }
+            ControlMessage::Shutdown => self.console_control.send(ConsoleControl::Shutdown).await?,
+            ControlMessage::PauseUpstream => self.console_control.send(ConsoleControl::PauseUpstream).await?,
+            ControlMessage::ResumeUpstream => self.console_control.send(ConsoleControl::ResumeUpstream).await?,
         }
         Ok(())
     }
@@ -488,8 +495,33 @@ impl UpstreamStats {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender<ConsoleControl>) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+
+    log::debug!("Created listening socket");
+
+    loop {
+        match listener.accept().await {
+            Ok((client_socket, addr)) => {
+                log::info!("Incoming client connection from {}", addr);
+                let db__ = db.clone();
+                let consctrl = console.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_client(client_socket, &db__, consctrl).await {
+                        log::error!("Error serving client: {}", e);
+                    }
+                    log::info!("Finished serving client from {}", addr);
+                });
+            }
+            Err(e) => {
+                log::error!("Listening incoming connections: {}", e);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn main() -> anyhow::Result<()> {
     env_logger::init();
     let opts: Opts = argh::from_env();
     let db = sled::Config::default()
@@ -513,34 +545,19 @@ async fn main() -> anyhow::Result<()> {
 
     log::debug!("Processed config file");
 
-    let listener = tokio::net::TcpListener::bind(opts.listen_addr).await?;
-
-    log::debug!("Created listening socket");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(3);
 
     let db_ = db.clone();
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((client_socket, addr)) => {
-                    log::info!("Incoming client connection from {}", addr);
-                    let db__ = db_.clone();
-                    let consctrl = tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = serve_client(client_socket, &db__, consctrl).await {
-                            log::error!("Error serving client: {}", e);
-                        }
-                        log::info!("Finished serving client from {}", addr);
-                    });
-                }
-                Err(e) => {
-                    log::error!("Listening incoming connections: {}", e);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let listen_addr = opts.listen_addr;
+    rt.spawn(async move {
+        if let Err(e) = socket_listener(listen_addr, &db_, tx).await {
+            log::error!("Socket listener: {}", e);
         }
     });
 
-    main_actor(config, &db, rx).await
+    let ret = rt.block_on(main_actor(config, &db, rx));
+    rt.shutdown_timeout(Duration::from_millis(100));
+    ret
 }
