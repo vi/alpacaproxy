@@ -423,6 +423,7 @@ pub async fn main_actor(
                 log::info!("Pausing upstream connector");
                 upstream_stats.0.lock().unwrap().status = UpstreamStatus::Paused;
                 upstream.as_ref().unwrap().abort();
+                upstream = None;
             }
             ConsoleControl::ResumeUpstream if upstream.is_none() => {
                 upstream_stats.0.lock().unwrap().status = UpstreamStatus::Connecting;
