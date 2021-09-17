@@ -57,6 +57,8 @@ pub enum ConsoleControl {
     ResumeUpstream,
     ClientConnected,
     ClientDisconnected,
+    WriteConfig(ClientConfig),
+    ReadConfig(OneshotSender<ClientConfig>),
 }
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
@@ -70,7 +72,7 @@ struct MinutelyData {
     rest: serde_json::Value,
 }
 
-#[derive(serde_derive::Serialize, serde_derive::Deserialize, Clone)]
+#[derive(serde_derive::Serialize, serde_derive::Deserialize, Clone, Debug)]
 pub struct ClientConfig {
     uri: Option<url::Url>,
 
@@ -125,6 +127,8 @@ enum ControlMessage {
     ResumeUpstream,
     CursorToSpecificId(u64),
     Password(String),
+    WriteConfig(ClientConfig),
+    ReadConfig,
 }
 
 
@@ -366,6 +370,18 @@ impl ServeClient {
                     self.err("No password required".to_owned()).await?;
                 }
             }
+            ControlMessage::WriteConfig(new_config) => {
+                self.console_control.send(ConsoleControl::WriteConfig(new_config)).await?
+            }
+            ControlMessage::ReadConfig => {
+                let (tx,rx) = tokio::sync::oneshot::channel();
+                self.console_control.send(ConsoleControl::ReadConfig(tx)).await?;
+                let cc = rx.await?;
+                self.ws.send(WebsocketMessage::Text(serde_json::to_string(&Message {
+                    stream: "config".to_owned(),
+                    data: serde_json::to_value(cc)?,
+                })?)).await?;
+            }
         }
         Ok(())
     }
@@ -435,6 +451,12 @@ pub async fn main_actor(
             }
             ConsoleControl::PauseUpstream | ConsoleControl::ResumeUpstream => {
                 log::warn!("Ignored useless PauseUpstream or ResumeUpstream message");
+            }
+            ConsoleControl::WriteConfig(new_config) => {
+                write_config(&config_filename, &new_config)?;
+            }
+            ConsoleControl::ReadConfig(tx) => {
+                let _ = tx.send(read_config(&config_filename)?);
             }
         }
     }
@@ -560,6 +582,13 @@ fn read_config(config_file: &std::path::Path) -> anyhow::Result<ClientConfig> {
     Ok(serde_json::from_reader(std::io::BufReader::new(
         std::fs::File::open(config_file)?,
     ))?)
+}
+
+fn write_config(config_file: &std::path::Path, config: &ClientConfig) -> anyhow::Result<()> {
+    serde_json::to_writer_pretty(std::io::BufWriter::new(
+        std::fs::File::create(config_file)?,
+    ), config)?;
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
