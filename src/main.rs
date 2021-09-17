@@ -1,9 +1,13 @@
 use std::convert::TryInto;
+use std::sync::Arc;
 use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::time::Duration;
+use tokio::time::Instant;
+use tokio::sync::oneshot::{Receiver as OneshotReceiver,Sender as OneshotSender};
+use tokio::sync::mpsc::{Sender, Receiver};
 
 use tokio_tungstenite::tungstenite::Message as WebsocketMessage;
 
@@ -38,6 +42,32 @@ enum ControlMessage {
     DatabaseSize,
 }
 
+#[derive(serde_derive::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UpstreamStatus {
+    Disabled,
+    Paused,
+    Connecting,
+    Connected,
+}
+
+#[derive(serde_derive::Serialize)]
+pub struct SystemStatus {
+    database_size: u64,
+    total_messages: u64,
+    clients_connected: usize,
+    last_ticker_update_ms: Option<u64>,
+    upstream_status: UpstreamStatus,
+}
+pub enum ConsoleControl {
+    Status(OneshotSender<SystemStatus>),
+    Shutdown,
+    PauseUpstream,
+    ResumeUpstream,
+    ClientConnected,
+    ClientDisconnected,
+}
+
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 struct MinutelyData {
     ev: String,
@@ -49,8 +79,8 @@ struct MinutelyData {
     rest: serde_json::Value,
 }
 
-#[derive(serde_derive::Serialize, serde_derive::Deserialize)]
-struct ClientConfig {
+#[derive(serde_derive::Serialize, serde_derive::Deserialize, Clone)]
+pub struct ClientConfig {
     #[serde(with = "http_serde::uri")]
     uri: http::Uri,
 
@@ -274,57 +304,126 @@ async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db) -> an
     c.run().await
 }
 
-async fn handle_upstream(config: &ClientConfig, db: &sled::Db) -> anyhow::Result<()> {
-    log::debug!("Establishing upstream connection 1");
-    let (mut upstream, _) = tokio_tungstenite::connect_async(&config.uri).await?;
-    log::debug!("Establishing upstream connection 2");
-    for startup_msg in &config.startup_messages {
-        upstream
-            .send(WebsocketMessage::Text(serde_json::to_string(startup_msg)?))
-            .await?;
+pub struct UpstreamStatsBuffer {
+    last_update: Option<Instant>,
+    status: UpstreamStatus,
+}
+pub struct UpstreamStats(std::sync::Mutex<UpstreamStatsBuffer>);
+
+pub async fn main_actor(config: Option<ClientConfig>, db: &sled::Db, mut rx: Receiver<ConsoleControl>) -> anyhow::Result<()> {
+    let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
+        last_update: None,
+        status: if config.is_some() { UpstreamStatus::Connecting } else { UpstreamStatus::Disabled },
+    })));
+   
+    let mut upstream = Some( tokio::spawn(upstream_stats.clone().connect_upstream(config.clone(), db.clone())));
+
+    let mut num_clients = 0usize;
+
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ConsoleControl::Shutdown => {
+                log::info!("Received shutdown message, exiting.");
+                break;
+            }
+            ConsoleControl::ClientConnected => num_clients += 1,
+            ConsoleControl::ClientDisconnected => num_clients -= 1,
+            ConsoleControl::Status(_) => todo!(),
+            ConsoleControl::PauseUpstream if upstream.is_some() => {
+                log::info!("Pausing upstream connector");
+                upstream_stats.0.lock().unwrap().status = UpstreamStatus::Paused;
+                upstream.as_ref().unwrap().abort();
+            }
+            ConsoleControl::ResumeUpstream if upstream.is_none() => {
+                upstream_stats.0.lock().unwrap().status = UpstreamStatus::Connecting;
+                upstream = Some( tokio::spawn(upstream_stats.clone().connect_upstream(config.clone(), db.clone())));
+            }
+            ConsoleControl::PauseUpstream | ConsoleControl::ResumeUpstream => {
+                log::warn!("Ignored useless PauseUpstream or ResumeUpstream message");
+            }
+        }
     }
-    log::debug!("Establishing upstream connection 3");
+    log::info!("Shutting down");
+   
 
-    let mut nextkey = get_next_db_key(&db)?;
+    Ok(())
+}
 
-    let mut handle_msg = |msg: Message| -> anyhow::Result<()> {
-        match &msg.stream[..] {
-            "listening" => {
-                log::info!("Established upstream connection");
+impl UpstreamStats {
+    async fn connect_upstream(self: Arc<Self>, config: Option<ClientConfig>, db: sled::Db) -> () {
+        if let Some(config) = config {
+            loop {
+                if let Err(e) = self.clone().handle_upstream(&config, &db).await {
+                    log::error!("Handling upstream connection existed with error: {}", e);
+                }
+                self.0.lock().unwrap().status = UpstreamStatus::Connecting;
+                log::info!("Finished upstream connection");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
             }
-            "authorization" => {
-                log::debug!("Received 'authorization' response");
+        } else {
+            self.0.lock().unwrap().status = UpstreamStatus::Disabled;
+            log::warn!("Not using any upstream, just waiting endlessly");
+            futures::future::pending::<()>().await;
+        }
+    }
+
+    async fn handle_upstream(self: Arc<Self>, config: &ClientConfig, db: &sled::Db) -> anyhow::Result<()> {
+        log::debug!("Establishing upstream connection 1");
+        let (mut upstream, _) = tokio_tungstenite::connect_async(&config.uri).await?;
+        log::debug!("Establishing upstream connection 2");
+        for startup_msg in &config.startup_messages {
+            upstream
+                .send(WebsocketMessage::Text(serde_json::to_string(startup_msg)?))
+                .await?;
+        }
+        log::debug!("Establishing upstream connection 3");
+
+        let mut nextkey = get_next_db_key(&db)?;
+
+        let mut handle_msg = |msg: Message| -> anyhow::Result<()> {
+            match &msg.stream[..] {
+                "listening" => {
+                    log::info!("Established upstream connection");
+                    self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                }
+                "authorization" => {
+                    log::debug!("Received 'authorization' response");
+                }
+                x if x.starts_with("AM.") => {
+                    log::debug!("Received minutely update for {}", x);
+                    self.0.lock().unwrap().last_update = Some(Instant::now());
+                    db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
+                    nextkey = nextkey.checked_add(1).context("Key space is full")?;
+                }
+                x => {
+                    log::warn!("Strange message from upstram of type {}", x);
+                }
             }
-            x if x.starts_with("AM.") => {
-                log::debug!("Received minutely update for {}", x);
-                db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
-                nextkey = nextkey.checked_add(1).context("Key space is full")?;
-            }
-            x => {
-                log::warn!("Strange message from upstram of type {}", x);
+            Ok(())
+        };
+
+        while let Some(msg) = upstream.next().await {
+            match msg {
+                Ok(WebsocketMessage::Text(msg)) => handle_msg(serde_json::from_str(&msg)?)?,
+                Ok(WebsocketMessage::Binary(msg)) => handle_msg(serde_json::from_slice(&msg)?)?,
+                Ok(WebsocketMessage::Close(c)) => {
+                    log::warn!("Close message from upstream: {:?}", c);
+                    break;
+                }
+                Ok(WebsocketMessage::Ping(_)) => {
+                    log::debug!("WebSocket ping from upstream");
+                }
+                Ok(_) => {
+                    log::warn!("other WebSocket message from upstream");
+                }
+                Err(e) => log::error!("From upstream websocket: {}", e),
             }
         }
         Ok(())
-    };
-
-    while let Some(msg) = upstream.next().await {
-        match msg {
-            Ok(WebsocketMessage::Text(msg)) => handle_msg(serde_json::from_str(&msg)?)?,
-            Ok(WebsocketMessage::Binary(msg)) => handle_msg(serde_json::from_slice(&msg)?)?,
-            Ok(WebsocketMessage::Close(c)) => {
-                log::warn!("Close message from upstream: {:?}", c);
-            }
-            Ok(WebsocketMessage::Ping(_)) => {
-                log::debug!("WebSocket ping from upstream");
-            }
-            Ok(_) => {
-                log::warn!("other WebSocket message from upstream");
-            }
-            Err(e) => log::error!("From upstream websocket: {}", e),
-        }
     }
-    Ok(())
 }
+
+
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -355,6 +454,9 @@ async fn main() -> anyhow::Result<()> {
 
     log::debug!("Created listening socket");
 
+    let (tx, rx) = tokio::sync::mpsc::channel(3);
+
+
     let db_ = db.clone();
     tokio::spawn(async move {
         loop {
@@ -377,18 +479,5 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    if let Some(config) = config {
-        loop {
-            if let Err(e) = handle_upstream(&config, &db).await {
-                log::error!("Handling upstream connection existed with error: {}", e);
-            }
-            log::info!("Finished upstream connection");
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
-    } else {
-        log::warn!("Not using any upstream, just waiting endlessly");
-        futures::future::pending::<()>().await;
-        Ok(())
-    }
-
+    main_actor(config, &db, rx).await
 }
