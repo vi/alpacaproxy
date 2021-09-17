@@ -88,10 +88,11 @@ struct MinutelyData {
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize, Clone)]
 pub struct ClientConfig {
-    #[serde(with = "http_serde::uri")]
-    uri: http::Uri,
+    uri: Option<url::Url>,
 
     startup_messages: Vec<serde_json::Value>,
+
+    require_password: Option<String>,
 }
 
 fn get_next_db_key(db: &sled::Db) -> anyhow::Result<u64> {
@@ -357,23 +358,19 @@ pub struct UpstreamStatsBuffer {
 pub struct UpstreamStats(std::sync::Mutex<UpstreamStatsBuffer>);
 
 pub async fn main_actor(
-    config: Option<ClientConfig>,
+    config_filename: PathBuf,
     db: &sled::Db,
     mut rx: Receiver<ConsoleControl>,
 ) -> anyhow::Result<()> {
     let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
         last_update: None,
-        status: if config.is_some() {
-            UpstreamStatus::Connecting
-        } else {
-            UpstreamStatus::Disabled
-        },
+        status: UpstreamStatus::Disabled,
     })));
 
     let mut upstream = Some(tokio::spawn(
         upstream_stats
             .clone()
-            .connect_upstream(config.clone(), db.clone()),
+            .connect_upstream(config_filename.clone(), db.clone()),
     ));
 
     let mut num_clients = 0usize;
@@ -412,7 +409,7 @@ pub async fn main_actor(
                 upstream = Some(tokio::spawn(
                     upstream_stats
                         .clone()
-                        .connect_upstream(config.clone(), db.clone()),
+                        .connect_upstream(config_filename.clone(), db.clone()),
                 ));
             }
             ConsoleControl::PauseUpstream | ConsoleControl::ResumeUpstream => {
@@ -426,10 +423,17 @@ pub async fn main_actor(
 }
 
 impl UpstreamStats {
-    async fn connect_upstream(self: Arc<Self>, config: Option<ClientConfig>, db: sled::Db) -> () {
-        if let Some(config) = config {
+    async fn connect_upstream(self: Arc<Self>, config_filename: PathBuf, db: sled::Db) -> () {
+        let config: ClientConfig = match read_config(&config_filename) {
+            Ok(x) => x,
+            Err(e) => {
+                log::error!("Failed to read config file: {}", e);
+                return;
+            }
+        };
+        if let Some(uri) = &config.uri {
             loop {
-                if let Err(e) = self.clone().handle_upstream(&config, &db).await {
+                if let Err(e) = self.clone().handle_upstream(&uri, &config.startup_messages, &db).await {
                     log::error!("Handling upstream connection existed with error: {}", e);
                 }
                 self.0.lock().unwrap().status = UpstreamStatus::Connecting;
@@ -445,13 +449,14 @@ impl UpstreamStats {
 
     async fn handle_upstream(
         self: Arc<Self>,
-        config: &ClientConfig,
+        uri: &url::Url,
+        startup_messages: &[serde_json::Value],
         db: &sled::Db,
     ) -> anyhow::Result<()> {
         log::debug!("Establishing upstream connection 1");
-        let (mut upstream, _) = tokio_tungstenite::connect_async(&config.uri).await?;
+        let (mut upstream, _) = tokio_tungstenite::connect_async(uri).await?;
         log::debug!("Establishing upstream connection 2");
-        for startup_msg in &config.startup_messages {
+        for startup_msg in startup_messages {
             upstream
                 .send(WebsocketMessage::Text(serde_json::to_string(startup_msg)?))
                 .await?;
@@ -529,29 +534,33 @@ async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender
     }
 }
 
+fn read_config(config_file: &std::path::Path) -> anyhow::Result<ClientConfig> {
+    Ok(serde_json::from_reader(std::io::BufReader::new(
+        std::fs::File::open(config_file)?,
+    ))?)
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+
     let opts: Opts = argh::from_env();
+
+    let _ = read_config(&opts.client_config)?;
+    log::debug!("Checked config file");
+
+
     let db = sled::Config::default()
         .cache_capacity(1024 * 1024)
         .use_compression(true)
         .compression_factor(1)
         .path(opts.database)
         .open()?;
+
     log::debug!("Opened the database");
+
     if db.was_recovered() {
         log::warn!("Database was recovered");
     }
-
-    let config: Option<ClientConfig> = if opts.client_config.as_os_str().to_string_lossy() == "." {
-        None
-    } else {
-        Some(serde_json::from_reader(std::io::BufReader::new(
-            std::fs::File::open(opts.client_config)?,
-        ))?)
-    };
-
-    log::debug!("Processed config file");
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
 
@@ -565,7 +574,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let ret = rt.block_on(main_actor(config, &db, rx));
+    let ret = rt.block_on(main_actor(opts.client_config, &db, rx));
     rt.shutdown_timeout(Duration::from_millis(100));
     ret
 }

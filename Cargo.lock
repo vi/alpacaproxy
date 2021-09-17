@@ -23,7 +23,6 @@ dependencies = [
  "futures",
  "hashbrown",
  "http",
- "http-serde",
  "log",
  "serde",
  "serde_derive",
@@ -32,6 +31,7 @@ dependencies = [
  "smol_str",
  "tokio",
  "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]
@@ -381,16 +381,6 @@ dependencies = [
  "bytes",
  "fnv",
  "itoa",
-]
-
-[[package]]
-name = "http-serde"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25698ac7002625796d5a7df8f0602400571da944c2edc1d5c268a6947dd4f692"
-dependencies = [
- "http",
- "serde",
 ]
 
 [[package]]
@@ -1043,6 +1033,7 @@ dependencies = [
  "idna",
  "matches",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]
