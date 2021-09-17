@@ -44,6 +44,7 @@ enum ControlMessage {
     Shutdown,
     PauseUpstream,
     ResumeUpstream,
+    CursorToSpecificId(u64),
 }
 
 #[derive(serde_derive::Serialize, Clone, Copy, Debug)]
@@ -58,7 +59,8 @@ enum UpstreamStatus {
 #[derive(serde_derive::Serialize, Debug)]
 pub struct SystemStatus {
     database_size: u64,
-    total_messages: u64,
+    first_datum_id: Option<u64>,
+    last_datum_id: Option<u64>,
     clients_connected: usize,
     last_ticker_update_ms: Option<u64>,
     upstream_status: UpstreamStatus,
@@ -105,22 +107,22 @@ fn get_next_db_key(db: &sled::Db) -> anyhow::Result<u64> {
     Ok(nextkey)
 }
 
-fn get_message_count(db: &sled::Db) -> anyhow::Result<u64> {
+fn get_first_last_id(db: &sled::Db) -> anyhow::Result<(Option<u64>,Option<u64>)> {
     let firstkey = match db.first()? {
-        None => 0,
+        None => None,
         Some((k, _v)) => {
             let k: [u8; 8] = k.as_ref().try_into()?;
-            u64::from_be_bytes(k)
+            Some(u64::from_be_bytes(k))
         }
     };
     let lastkey = match db.last()? {
-        None => 0,
+        None => Some(0),
         Some((k, _v)) => {
             let k: [u8; 8] = k.as_ref().try_into()?;
-            u64::from_be_bytes(k)
+            Some(u64::from_be_bytes(k))
         }
     };
-    Ok(lastkey - firstkey)
+    Ok((firstkey, lastkey))
 }
 
 
@@ -325,6 +327,7 @@ impl ServeClient {
             ControlMessage::Shutdown => self.console_control.send(ConsoleControl::Shutdown).await?,
             ControlMessage::PauseUpstream => self.console_control.send(ConsoleControl::PauseUpstream).await?,
             ControlMessage::ResumeUpstream => self.console_control.send(ConsoleControl::ResumeUpstream).await?,
+            ControlMessage::CursorToSpecificId(newid) => self.cursor = newid,
         }
         Ok(())
     }
@@ -384,15 +387,17 @@ pub async fn main_actor(
             ConsoleControl::ClientConnected => num_clients += 1,
             ConsoleControl::ClientDisconnected => num_clients -= 1,
             ConsoleControl::Status(tx) => {
+                let (first_datum_id, last_datum_id) = get_first_last_id(db)?;
                 let stats = upstream_stats.0.lock().unwrap();
                 let ss = SystemStatus {
                     database_size: db.size_on_disk()?,
-                    total_messages: get_message_count(db)?,
                     clients_connected: num_clients,
                     last_ticker_update_ms: stats.last_update.map(|lu| {
                         Instant::now().duration_since(lu).as_millis() as u64
                     }),
                     upstream_status: stats.status,
+                    first_datum_id,
+                    last_datum_id,
                 };
                 drop(stats);
                 let _ = tx.send(ss);
