@@ -5,9 +5,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::time::Duration;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot::{Receiver as OneshotReceiver, Sender as OneshotSender};
 use tokio::time::Instant;
-use tokio::sync::oneshot::{Receiver as OneshotReceiver,Sender as OneshotSender};
-use tokio::sync::mpsc::{Sender, Receiver};
 
 use tokio_tungstenite::tungstenite::Message as WebsocketMessage;
 
@@ -30,7 +30,6 @@ struct Message {
     data: serde_json::Value,
 }
 
-
 #[derive(serde_derive::Deserialize)]
 #[serde(tag = "stream", content = "data")]
 #[serde(rename_all = "snake_case")]
@@ -40,9 +39,10 @@ enum ControlMessage {
     Filter(Vec<String>),
     RemoveRetainingLastN(u64),
     DatabaseSize,
+    Stats,
 }
 
-#[derive(serde_derive::Serialize)]
+#[derive(serde_derive::Serialize, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
 enum UpstreamStatus {
     Disabled,
@@ -51,7 +51,7 @@ enum UpstreamStatus {
     Connected,
 }
 
-#[derive(serde_derive::Serialize)]
+#[derive(serde_derive::Serialize, Debug)]
 pub struct SystemStatus {
     database_size: u64,
     total_messages: u64,
@@ -59,6 +59,7 @@ pub struct SystemStatus {
     last_ticker_update_ms: Option<u64>,
     upstream_status: UpstreamStatus,
 }
+#[derive(Debug)]
 pub enum ConsoleControl {
     Status(OneshotSender<SystemStatus>),
     Shutdown,
@@ -100,11 +101,32 @@ fn get_next_db_key(db: &sled::Db) -> anyhow::Result<u64> {
     Ok(nextkey)
 }
 
+fn get_message_count(db: &sled::Db) -> anyhow::Result<u64> {
+    let firstkey = match db.first()? {
+        None => 0,
+        Some((k, _v)) => {
+            let k: [u8; 8] = k.as_ref().try_into()?;
+            u64::from_be_bytes(k)
+        }
+    };
+    let lastkey = match db.last()? {
+        None => 0,
+        Some((k, _v)) => {
+            let k: [u8; 8] = k.as_ref().try_into()?;
+            u64::from_be_bytes(k)
+        }
+    };
+    Ok(lastkey - firstkey)
+}
+
+
+
 struct ServeClient {
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     db: sled::Db,
     cursor: u64,
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
+    console_control: Sender<ConsoleControl>,
 }
 
 impl ServeClient {
@@ -120,24 +142,20 @@ impl ServeClient {
 
         while let Some(msg) = self.ws.next().await {
             let cmsg: ControlMessage = match msg {
-                Ok(WebsocketMessage::Text(msg)) => {
-                    match serde_json::from_str(&msg) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            self.err(e.to_string()).await?;
-                            continue;
-                        }
+                Ok(WebsocketMessage::Text(msg)) => match serde_json::from_str(&msg) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.err(e.to_string()).await?;
+                        continue;
                     }
-                }
-                Ok(WebsocketMessage::Binary(msg)) => {
-                    match serde_json::from_slice(&msg) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            self.err(e.to_string()).await?;
-                            continue;
-                        }
+                },
+                Ok(WebsocketMessage::Binary(msg)) => match serde_json::from_slice(&msg) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.err(e.to_string()).await?;
+                        continue;
                     }
-                }
+                },
                 Ok(WebsocketMessage::Close(c)) => {
                     log::info!("Close message from client: {:?}", c);
                     break;
@@ -164,14 +182,15 @@ impl ServeClient {
 
     async fn err(&mut self, x: String) -> anyhow::Result<()> {
         log::warn!("Sending error to client: {}", x);
-        self.ws.send(WebsocketMessage::Text(
-                    serde_json::to_string(&Message {
-                        stream: "error".to_owned(),
-                        data: serde_json::Value::String(x),
-                    })
-                    .unwrap(),
-                ))
-                .await?;
+        self.ws
+            .send(WebsocketMessage::Text(
+                serde_json::to_string(&Message {
+                    stream: "error".to_owned(),
+                    data: serde_json::Value::String(x),
+                })
+                .unwrap(),
+            ))
+            .await?;
         Ok(())
     }
 
@@ -187,7 +206,7 @@ impl ServeClient {
             }
         };
         if let Some(filt) = &self.filter {
-            if ! filt.contains(&smol_str::SmolStr::new(&minutely.t)) {
+            if !filt.contains(&smol_str::SmolStr::new(&minutely.t)) {
                 return Ok(());
             }
         }
@@ -202,7 +221,7 @@ impl ServeClient {
         Ok(())
     }
 
-    async fn preroller(&mut self, range: impl Iterator<Item=u64>) -> anyhow::Result<()> {
+    async fn preroller(&mut self, range: impl Iterator<Item = u64>) -> anyhow::Result<()> {
         for x in range {
             let x: u64 = x;
             match self.db.get(x.to_be_bytes())? {
@@ -287,21 +306,35 @@ impl ServeClient {
             ControlMessage::Filter(a) => {
                 self.filter = Some(a.into_iter().map(smol_str::SmolStr::new).collect());
             }
+            ControlMessage::Stats => {
+                let (tx,rx) = tokio::sync::oneshot::channel();
+                self.console_control.send(ConsoleControl::Status(tx)).await?;
+                let ss = rx.await?;
+                self.ws.send(WebsocketMessage::Text(serde_json::to_string(&Message {
+                    stream: "stats".to_owned(),
+                    data: serde_json::to_value(ss)?,
+                })?)).await?;
+            }
         }
         Ok(())
     }
 }
 
-async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db) -> anyhow::Result<()> {
-    let ws  = tokio_tungstenite::accept_async(client_socket).await?;
+async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db, console_control: Sender<ConsoleControl>) -> anyhow::Result<()> {
+    let ws = tokio_tungstenite::accept_async(client_socket).await?;
     let cursor = get_next_db_key(db)?;
+    let cc2 = console_control.clone();
     let c = ServeClient {
         ws,
         db: db.clone(),
         cursor,
         filter: None,
+        console_control,
     };
-    c.run().await
+    let _ = cc2.send(ConsoleControl::ClientConnected).await;
+    let ret = c.run().await;
+    let _ = cc2.send(ConsoleControl::ClientDisconnected).await;
+    ret
 }
 
 pub struct UpstreamStatsBuffer {
@@ -310,13 +343,25 @@ pub struct UpstreamStatsBuffer {
 }
 pub struct UpstreamStats(std::sync::Mutex<UpstreamStatsBuffer>);
 
-pub async fn main_actor(config: Option<ClientConfig>, db: &sled::Db, mut rx: Receiver<ConsoleControl>) -> anyhow::Result<()> {
+pub async fn main_actor(
+    config: Option<ClientConfig>,
+    db: &sled::Db,
+    mut rx: Receiver<ConsoleControl>,
+) -> anyhow::Result<()> {
     let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
         last_update: None,
-        status: if config.is_some() { UpstreamStatus::Connecting } else { UpstreamStatus::Disabled },
+        status: if config.is_some() {
+            UpstreamStatus::Connecting
+        } else {
+            UpstreamStatus::Disabled
+        },
     })));
-   
-    let mut upstream = Some( tokio::spawn(upstream_stats.clone().connect_upstream(config.clone(), db.clone())));
+
+    let mut upstream = Some(tokio::spawn(
+        upstream_stats
+            .clone()
+            .connect_upstream(config.clone(), db.clone()),
+    ));
 
     let mut num_clients = 0usize;
 
@@ -328,7 +373,20 @@ pub async fn main_actor(config: Option<ClientConfig>, db: &sled::Db, mut rx: Rec
             }
             ConsoleControl::ClientConnected => num_clients += 1,
             ConsoleControl::ClientDisconnected => num_clients -= 1,
-            ConsoleControl::Status(_) => todo!(),
+            ConsoleControl::Status(tx) => {
+                let stats = upstream_stats.0.lock().unwrap();
+                let ss = SystemStatus {
+                    database_size: db.size_on_disk()?,
+                    total_messages: get_message_count(db)?,
+                    clients_connected: num_clients,
+                    last_ticker_update_ms: stats.last_update.map(|lu| {
+                        Instant::now().duration_since(lu).as_millis() as u64
+                    }),
+                    upstream_status: stats.status,
+                };
+                drop(stats);
+                let _ = tx.send(ss);
+            }
             ConsoleControl::PauseUpstream if upstream.is_some() => {
                 log::info!("Pausing upstream connector");
                 upstream_stats.0.lock().unwrap().status = UpstreamStatus::Paused;
@@ -336,7 +394,11 @@ pub async fn main_actor(config: Option<ClientConfig>, db: &sled::Db, mut rx: Rec
             }
             ConsoleControl::ResumeUpstream if upstream.is_none() => {
                 upstream_stats.0.lock().unwrap().status = UpstreamStatus::Connecting;
-                upstream = Some( tokio::spawn(upstream_stats.clone().connect_upstream(config.clone(), db.clone())));
+                upstream = Some(tokio::spawn(
+                    upstream_stats
+                        .clone()
+                        .connect_upstream(config.clone(), db.clone()),
+                ));
             }
             ConsoleControl::PauseUpstream | ConsoleControl::ResumeUpstream => {
                 log::warn!("Ignored useless PauseUpstream or ResumeUpstream message");
@@ -344,7 +406,6 @@ pub async fn main_actor(config: Option<ClientConfig>, db: &sled::Db, mut rx: Rec
         }
     }
     log::info!("Shutting down");
-   
 
     Ok(())
 }
@@ -367,7 +428,11 @@ impl UpstreamStats {
         }
     }
 
-    async fn handle_upstream(self: Arc<Self>, config: &ClientConfig, db: &sled::Db) -> anyhow::Result<()> {
+    async fn handle_upstream(
+        self: Arc<Self>,
+        config: &ClientConfig,
+        db: &sled::Db,
+    ) -> anyhow::Result<()> {
         log::debug!("Establishing upstream connection 1");
         let (mut upstream, _) = tokio_tungstenite::connect_async(&config.uri).await?;
         log::debug!("Establishing upstream connection 2");
@@ -423,8 +488,6 @@ impl UpstreamStats {
     }
 }
 
-
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
@@ -456,7 +519,6 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = tokio::sync::mpsc::channel(3);
 
-
     let db_ = db.clone();
     tokio::spawn(async move {
         loop {
@@ -464,8 +526,9 @@ async fn main() -> anyhow::Result<()> {
                 Ok((client_socket, addr)) => {
                     log::info!("Incoming client connection from {}", addr);
                     let db__ = db_.clone();
+                    let consctrl = tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = serve_client(client_socket, &db__).await {
+                        if let Err(e) = serve_client(client_socket, &db__, consctrl).await {
                             log::error!("Error serving client: {}", e);
                         }
                         log::info!("Finished serving client from {}", addr);
