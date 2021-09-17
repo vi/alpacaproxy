@@ -79,6 +79,8 @@ pub struct ClientConfig {
     startup_messages: Vec<serde_json::Value>,
 
     require_password: Option<String>,
+
+    automirror: bool,
 }
 
 fn get_next_db_key(db: &sled::Db) -> anyhow::Result<u64> {
@@ -94,7 +96,7 @@ fn get_next_db_key(db: &sled::Db) -> anyhow::Result<u64> {
     Ok(nextkey)
 }
 
-fn get_first_last_id(db: &sled::Db) -> anyhow::Result<(Option<u64>,Option<u64>)> {
+fn get_first_last_id(db: &sled::Db) -> anyhow::Result<(Option<u64>, Option<u64>)> {
     let firstkey = match db.first()? {
         None => None,
         Some((k, _v)) => {
@@ -103,7 +105,7 @@ fn get_first_last_id(db: &sled::Db) -> anyhow::Result<(Option<u64>,Option<u64>)>
         }
     };
     let lastkey = match db.last()? {
-        None => Some(0),
+        None => None,
         Some((k, _v)) => {
             let k: [u8; 8] = k.as_ref().try_into()?;
             Some(u64::from_be_bytes(k))
@@ -112,7 +114,7 @@ fn get_first_last_id(db: &sled::Db) -> anyhow::Result<(Option<u64>,Option<u64>)>
     Ok((firstkey, lastkey))
 }
 
-#[derive(serde_derive::Deserialize)]
+#[derive(serde_derive::Deserialize, serde_derive::Serialize)]
 #[serde(tag = "stream", content = "data")]
 #[serde(rename_all = "snake_case")]
 enum ControlMessage {
@@ -131,17 +133,21 @@ enum ControlMessage {
     ReadConfig,
 }
 
-
 struct ServeClient {
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     db: sled::Db,
     cursor: u64,
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
     console_control: Sender<ConsoleControl>,
-    require_password: Option<String>
+    require_password: Option<String>,
 }
 
-async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db, console_control: Sender<ConsoleControl>, require_password: Option<String>) -> anyhow::Result<()> {
+async fn serve_client(
+    client_socket: tokio::net::TcpStream,
+    db: &sled::Db,
+    console_control: Sender<ConsoleControl>,
+    require_password: Option<String>,
+) -> anyhow::Result<()> {
     let ws = tokio_tungstenite::accept_async(client_socket).await?;
     let cursor = get_next_db_key(db)?;
     let cc2 = console_control.clone();
@@ -158,7 +164,6 @@ async fn serve_client(client_socket: tokio::net::TcpStream, db: &sled::Db, conso
     let _ = cc2.send(ConsoleControl::ClientDisconnected).await;
     ret
 }
-
 
 impl ServeClient {
     async fn run(mut self) -> anyhow::Result<()> {
@@ -266,15 +271,17 @@ impl ServeClient {
     }
 
     async fn handle_msg(&mut self, msg: ControlMessage) -> anyhow::Result<()> {
-        if self.require_password.is_some() && ! matches!(msg, ControlMessage::Password(..)) {
+        if self.require_password.is_some() && !matches!(msg, ControlMessage::Password(..)) {
             self.err("Supply a password first".to_owned()).await?;
             return Ok(());
         }
         match msg {
             ControlMessage::Preroll(num) => {
-                log::info!("  prerolling {} messages for the client", num);
                 let start = self.cursor.saturating_sub(num);
-                self.preroller(start..self.cursor).await?;
+                let rangeend = get_first_last_id(&self.db)?.1.unwrap_or(self.cursor);
+                let range = start..=rangeend;
+                log::info!("  prerolling {} messages for the client, really {}", num, rangeend+1-start);
+                self.preroller(range).await?;
                 {
                     let buf = serde_json::to_string(&Message {
                         stream: "preroll_finished".to_owned(),
@@ -284,6 +291,7 @@ impl ServeClient {
                     self.ws.send(WebsocketMessage::Text(buf)).await?;
                 }
                 log::debug!("  prerolling finished");
+                self.cursor = rangeend+1;
             }
             ControlMessage::Monitor => {
                 log::info!("  streaming messages for the client");
@@ -345,18 +353,33 @@ impl ServeClient {
                 self.filter = Some(a.into_iter().map(smol_str::SmolStr::new).collect());
             }
             ControlMessage::Status => {
-                let (tx,rx) = tokio::sync::oneshot::channel();
-                self.console_control.send(ConsoleControl::Status(tx)).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.console_control
+                    .send(ConsoleControl::Status(tx))
+                    .await?;
                 let ss = rx.await?;
-                self.ws.send(WebsocketMessage::Text(serde_json::to_string(&Message {
-                    stream: "stats".to_owned(),
-                    data: serde_json::to_value(ss)?,
-                })?)).await?;
+                self.ws
+                    .send(WebsocketMessage::Text(serde_json::to_string(&Message {
+                        stream: "stats".to_owned(),
+                        data: serde_json::to_value(ss)?,
+                    })?))
+                    .await?;
             }
             ControlMessage::Shutdown => self.console_control.send(ConsoleControl::Shutdown).await?,
-            ControlMessage::PauseUpstream => self.console_control.send(ConsoleControl::PauseUpstream).await?,
-            ControlMessage::ResumeUpstream => self.console_control.send(ConsoleControl::ResumeUpstream).await?,
-            ControlMessage::CursorToSpecificId(newid) => self.cursor = newid,
+            ControlMessage::PauseUpstream => {
+                self.console_control
+                    .send(ConsoleControl::PauseUpstream)
+                    .await?
+            }
+            ControlMessage::ResumeUpstream => {
+                self.console_control
+                    .send(ConsoleControl::ResumeUpstream)
+                    .await?
+            }
+            ControlMessage::CursorToSpecificId(newid) => {
+                log::info!("  explicit cursor set to {}", newid);
+                self.cursor = newid;
+            }
             ControlMessage::Password(supplied_password) => {
                 if let Some(required_password) = self.require_password.take() {
                     if required_password != supplied_password {
@@ -371,16 +394,22 @@ impl ServeClient {
                 }
             }
             ControlMessage::WriteConfig(new_config) => {
-                self.console_control.send(ConsoleControl::WriteConfig(new_config)).await?
+                self.console_control
+                    .send(ConsoleControl::WriteConfig(new_config))
+                    .await?
             }
             ControlMessage::ReadConfig => {
-                let (tx,rx) = tokio::sync::oneshot::channel();
-                self.console_control.send(ConsoleControl::ReadConfig(tx)).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.console_control
+                    .send(ConsoleControl::ReadConfig(tx))
+                    .await?;
                 let cc = rx.await?;
-                self.ws.send(WebsocketMessage::Text(serde_json::to_string(&Message {
-                    stream: "config".to_owned(),
-                    data: serde_json::to_value(cc)?,
-                })?)).await?;
+                self.ws
+                    .send(WebsocketMessage::Text(serde_json::to_string(&Message {
+                        stream: "config".to_owned(),
+                        data: serde_json::to_value(cc)?,
+                    })?))
+                    .await?;
             }
         }
         Ok(())
@@ -425,9 +454,9 @@ pub async fn main_actor(
                 let ss = SystemStatus {
                     database_size: db.size_on_disk()?,
                     clients_connected: num_clients,
-                    last_ticker_update_ms: stats.last_update.map(|lu| {
-                        Instant::now().duration_since(lu).as_millis() as u64
-                    }),
+                    last_ticker_update_ms: stats
+                        .last_update
+                        .map(|lu| Instant::now().duration_since(lu).as_millis() as u64),
                     upstream_status: stats.status,
                     first_datum_id,
                     last_datum_id,
@@ -476,7 +505,11 @@ impl UpstreamStats {
         };
         if let Some(uri) = &config.uri {
             loop {
-                if let Err(e) = self.clone().handle_upstream(&uri, &config.startup_messages, &db).await {
+                if let Err(e) = self
+                    .clone()
+                    .handle_upstream(&uri, &config.startup_messages, config.automirror, &db)
+                    .await
+                {
                     log::error!("Handling upstream connection existed with error: {}", e);
                 }
                 self.0.lock().unwrap().status = UpstreamStatus::Connecting;
@@ -494,6 +527,7 @@ impl UpstreamStats {
         self: Arc<Self>,
         uri: &url::Url,
         startup_messages: &[serde_json::Value],
+        automirror: bool,
         db: &sled::Db,
     ) -> anyhow::Result<()> {
         log::debug!("Establishing upstream connection 1");
@@ -502,6 +536,27 @@ impl UpstreamStats {
         for startup_msg in startup_messages {
             upstream
                 .send(WebsocketMessage::Text(serde_json::to_string(startup_msg)?))
+                .await?;
+        }
+        if automirror {
+            let cursor = match get_first_last_id(db)? {
+                (_, Some(x)) => x+1,
+                _ => 0,
+            };
+            upstream
+                .send(WebsocketMessage::Text(serde_json::to_string(
+                    &ControlMessage::CursorToSpecificId(cursor),
+                )?))
+                .await?;
+            upstream
+                .send(WebsocketMessage::Text(serde_json::to_string(
+                    &ControlMessage::Preroll(0),
+                )?))
+                .await?;
+            upstream
+                .send(WebsocketMessage::Text(serde_json::to_string(
+                    &ControlMessage::Monitor,
+                )?))
                 .await?;
         }
         log::debug!("Establishing upstream connection 3");
@@ -516,6 +571,13 @@ impl UpstreamStats {
                 }
                 "authorization" => {
                     log::debug!("Received 'authorization' response");
+                }
+                "preroll_finished" => {
+                    log::debug!("Received 'preroll_finished' response");
+                }
+                "hello" => {
+                    log::info!("Established upstream connection with a proxy");
+                    self.0.lock().unwrap().status = UpstreamStatus::Connected;
                 }
                 x if x.starts_with("AM.") => {
                     log::debug!("Received minutely update for {}", x);
@@ -551,7 +613,12 @@ impl UpstreamStats {
     }
 }
 
-async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender<ConsoleControl>, require_password: Option<String>) -> anyhow::Result<()> {
+async fn socket_listener(
+    listen_addr: SocketAddr,
+    db: &sled::Db,
+    console: Sender<ConsoleControl>,
+    require_password: Option<String>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     log::debug!("Created listening socket");
@@ -564,7 +631,9 @@ async fn socket_listener(listen_addr: SocketAddr, db: &sled::Db, console: Sender
                 let consctrl = console.clone();
                 let require_password = require_password.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_client(client_socket, &db__, consctrl, require_password).await {
+                    if let Err(e) =
+                        serve_client(client_socket, &db__, consctrl, require_password).await
+                    {
                         log::error!("Error serving client: {}", e);
                     }
                     log::info!("Finished serving client from {}", addr);
@@ -585,9 +654,10 @@ fn read_config(config_file: &std::path::Path) -> anyhow::Result<ClientConfig> {
 }
 
 fn write_config(config_file: &std::path::Path, config: &ClientConfig) -> anyhow::Result<()> {
-    serde_json::to_writer_pretty(std::io::BufWriter::new(
-        std::fs::File::create(config_file)?,
-    ), config)?;
+    serde_json::to_writer_pretty(
+        std::io::BufWriter::new(std::fs::File::create(config_file)?),
+        config,
+    )?;
     Ok(())
 }
 
@@ -598,7 +668,6 @@ fn main() -> anyhow::Result<()> {
 
     let first_config = read_config(&opts.client_config)?;
     log::debug!("Checked config file");
-
 
     let db = sled::Config::default()
         .cache_capacity(1024 * 1024)
@@ -613,14 +682,18 @@ fn main() -> anyhow::Result<()> {
         log::warn!("Database was recovered");
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(3);
 
     let db_ = db.clone();
     let listen_addr = opts.listen_addr;
     rt.spawn(async move {
-        if let Err(e) = socket_listener(listen_addr, &db_, tx, first_config.require_password).await {
+        if let Err(e) = socket_listener(listen_addr, &db_, tx, first_config.require_password).await
+        {
             log::error!("Socket listener: {}", e);
         }
     });
