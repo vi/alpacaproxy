@@ -288,6 +288,9 @@ impl ServeClient {
                             Ok(Some(_)) => ctr += 1,
                         }
                     }
+                    if ctr % 50 == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 {
                     let buf = serde_json::to_string(&Message {
