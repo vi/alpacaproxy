@@ -48,6 +48,7 @@ pub struct SystemStatus {
     clients_connected: usize,
     last_ticker_update_ms: Option<u64>,
     upstream_status: UpstreamStatus,
+    new_tickers_this_session: usize,
 }
 #[derive(Debug)]
 pub enum ConsoleControl {
@@ -419,6 +420,7 @@ impl ServeClient {
 pub struct UpstreamStatsBuffer {
     last_update: Option<Instant>,
     status: UpstreamStatus,
+    received_tickers: usize,
 }
 pub struct UpstreamStats(std::sync::Mutex<UpstreamStatsBuffer>);
 
@@ -430,6 +432,7 @@ pub async fn main_actor(
     let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
         last_update: None,
         status: UpstreamStatus::Disabled,
+        received_tickers: 0,
     })));
 
     let mut upstream = Some(tokio::spawn(
@@ -460,6 +463,7 @@ pub async fn main_actor(
                     upstream_status: stats.status,
                     first_datum_id,
                     last_datum_id,
+                    new_tickers_this_session: stats.received_tickers,
                 };
                 drop(stats);
                 let _ = tx.send(ss);
@@ -563,7 +567,7 @@ impl UpstreamStats {
 
         let mut nextkey = get_next_db_key(&db)?;
 
-        let mut handle_msg = |msg: Message| -> anyhow::Result<()> {
+        let mut handle_msg = |msg: Message| -> anyhow::Result<bool> {
             match &msg.stream[..] {
                 "listening" => {
                     log::info!("Established upstream connection");
@@ -581,19 +585,29 @@ impl UpstreamStats {
                 }
                 x if x.starts_with("AM.") => {
                     log::debug!("Received minutely update for {}", x);
-                    self.0.lock().unwrap().last_update = Some(Instant::now());
+                    let mut do_yield = false;
+                    {
+                        let mut stats = self.0.lock().unwrap();
+                        stats.last_update = Some(Instant::now());
+                        stats.received_tickers+=1;
+                        if stats.received_tickers % 50 == 0 {
+                            do_yield = true;
+                        }
+                    }
+                    
                     db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
                     nextkey = nextkey.checked_add(1).context("Key space is full")?;
+                    return Ok(do_yield); 
                 }
                 x => {
                     log::warn!("Strange message from upstram of type {}", x);
                 }
             }
-            Ok(())
+            Ok(false)
         };
 
         while let Some(msg) = upstream.next().await {
-            match msg {
+            let do_yield = match msg {
                 Ok(WebsocketMessage::Text(msg)) => handle_msg(serde_json::from_str(&msg)?)?,
                 Ok(WebsocketMessage::Binary(msg)) => handle_msg(serde_json::from_slice(&msg)?)?,
                 Ok(WebsocketMessage::Close(c)) => {
@@ -602,11 +616,19 @@ impl UpstreamStats {
                 }
                 Ok(WebsocketMessage::Ping(_)) => {
                     log::debug!("WebSocket ping from upstream");
+                    false
                 }
                 Ok(_) => {
                     log::warn!("other WebSocket message from upstream");
+                    false
                 }
-                Err(e) => log::error!("From upstream websocket: {}", e),
+                Err(e) => {
+                    log::error!("From upstream websocket: {}", e);
+                    false
+                }
+            };
+            if do_yield {
+                tokio::task::yield_now().await;
             }
         }
         Ok(())
