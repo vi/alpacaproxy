@@ -17,6 +17,11 @@ use tokio_tungstenite::tungstenite::Message as WebsocketMessage;
 /// Connect to Alpaca and act as a special caching proxy server for it
 #[derive(argh::FromArgs)]
 struct Opts {
+    /// show version and exit
+    #[argh(switch)]
+    #[allow(dead_code)]
+    version: bool,
+
     #[argh(positional)]
     database: PathBuf,
 
@@ -60,6 +65,7 @@ pub struct SystemStatus {
     last_ticker_update_ms: Option<u64>,
     upstream_status: UpstreamStatus,
     new_tickers_this_session: usize,
+    server_version: String,
 }
 #[derive(Debug)]
 pub enum ConsoleControl {
@@ -249,7 +255,7 @@ impl ServeClient {
                     continue;
                 }
                 Err(e) => {
-                    log::error!("From client websocket: {}", e);
+                    log::info!("  from client websocket: {}", e);
                     continue;
                 }
             };
@@ -511,6 +517,7 @@ pub async fn main_actor(
                     first_datum_id,
                     last_datum_id,
                     new_tickers_this_session: stats.received_tickers,
+                    server_version: env!("CARGO_PKG_VERSION").to_owned(),
                 };
                 drop(stats);
                 let _ = tx.send(ss);
@@ -805,6 +812,10 @@ pub async fn database_capper(db: sled::Db, size_cap: u64, database_size_checkup_
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().find(|x|x=="--version").is_some() {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     env_logger::init();
 
     let opts: Opts = argh::from_env();
