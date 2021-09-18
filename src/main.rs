@@ -24,6 +24,10 @@ struct Opts {
     #[argh(option,short='L')]
     max_database_size: Option<u64>,
 
+    /// satabase size scanning interval
+    #[argh(option,default="60")]
+    database_size_checkup_interval_secs: u64,
+
     #[argh(positional)]
     client_config: PathBuf,
 
@@ -769,7 +773,7 @@ fn write_config(config_file: &std::path::Path, config: &ClientConfig) -> anyhow:
     Ok(())
 }
 
-pub async fn database_capper(db: sled::Db, size_cap: u64) -> anyhow::Result<()> {
+pub async fn database_capper(db: sled::Db, size_cap: u64, database_size_checkup_interval_secs: u64) -> anyhow::Result<()> {
     let mut cached_db_size = 0;
     loop {
         let dbsz = db.size_on_disk()?;
@@ -795,11 +799,11 @@ pub async fn database_capper(db: sled::Db, size_cap: u64) -> anyhow::Result<()> 
             }
             let _ = db.flush_async().await;
             log::debug!("Trimmer run finished");
-            tokio::time::sleep(Duration::new(1, 0)).await;
+            tokio::time::sleep(Duration::new(database_size_checkup_interval_secs, 0)).await;
             cached_db_size = dbsz;
         } else {
             cached_db_size = dbsz;
-            tokio::time::sleep(Duration::new(10, 0)).await;
+            tokio::time::sleep(Duration::new(database_size_checkup_interval_secs, 0)).await;
         }
     }
 }
@@ -833,8 +837,9 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(size_cap) = opts.max_database_size {
         let db__ = db.clone();  
+        let database_size_checkup_interval_secs = opts.database_size_checkup_interval_secs;
         rt.spawn(async move {
-            if let Err(e) = database_capper(db__, size_cap).await {
+            if let Err(e) = database_capper(db__, size_cap, database_size_checkup_interval_secs).await {
                 log::error!("Database capper: {}", e);
                 log::error!("Database capper errors are critical. Exiting.");
                 std::process::exit(33);
