@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 #[allow(unused_imports)]
 use tokio::sync::oneshot::{Receiver as OneshotReceiver, Sender as OneshotSender};
 use tokio::time::Instant;
@@ -17,6 +17,10 @@ use tokio_tungstenite::tungstenite::Message as WebsocketMessage;
 struct Opts {
     #[argh(positional)]
     database: PathBuf,
+
+    /// start removing early entries from database if size exceeds this
+    #[argh(option,short='L')]
+    max_database_size: Option<u64>,
 
     #[argh(positional)]
     client_config: PathBuf,
@@ -141,14 +145,14 @@ struct ServeClient {
     db: sled::Db,
     cursor: Option<u64>,
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
-    console_control: Sender<ConsoleControl>,
+    console_control: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
 }
 
 async fn serve_client(
     client_socket: tokio::net::TcpStream,
     db: &sled::Db,
-    console_control: Sender<ConsoleControl>,
+    console_control: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
 ) -> anyhow::Result<()> {
     let ws = tokio_tungstenite::accept_async(client_socket).await?;
@@ -161,9 +165,9 @@ async fn serve_client(
         console_control,
         require_password,
     };
-    let _ = cc2.send(ConsoleControl::ClientConnected).await;
+    let _ = cc2.send(ConsoleControl::ClientConnected);
     let ret = c.run().await;
-    let _ = cc2.send(ConsoleControl::ClientDisconnected).await;
+    let _ = cc2.send(ConsoleControl::ClientDisconnected);
     ret
 }
 
@@ -174,7 +178,7 @@ impl ServeClient {
         }
         loop {
             let (tx,rx) = tokio::sync::oneshot::channel();
-            self.console_control.send(ConsoleControl::GetUpstreamState(tx)).await?;
+            self.console_control.send(ConsoleControl::GetUpstreamState(tx))?;
             let upstream_status = rx.await?;
             match upstream_status {
                 UpstreamStatus::Disabled => break,
@@ -194,7 +198,7 @@ impl ServeClient {
         let upstream_status;
         {
             let (tx,rx) = tokio::sync::oneshot::channel();
-            self.console_control.send(ConsoleControl::GetUpstreamState(tx)).await?;
+            self.console_control.send(ConsoleControl::GetUpstreamState(tx))?;
             upstream_status = rx.await?;
         }
 
@@ -390,8 +394,7 @@ impl ServeClient {
             ControlMessage::Status => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.console_control
-                    .send(ConsoleControl::Status(tx))
-                    .await?;
+                    .send(ConsoleControl::Status(tx))?;
                 let ss = rx.await?;
                 self.ws
                     .send(WebsocketMessage::Text(serde_json::to_string(&Message {
@@ -400,16 +403,14 @@ impl ServeClient {
                     })?))
                     .await?;
             }
-            ControlMessage::Shutdown => self.console_control.send(ConsoleControl::Shutdown).await?,
+            ControlMessage::Shutdown => self.console_control.send(ConsoleControl::Shutdown)?,
             ControlMessage::PauseUpstream => {
                 self.console_control
-                    .send(ConsoleControl::PauseUpstream)
-                    .await?
+                    .send(ConsoleControl::PauseUpstream)?
             }
             ControlMessage::ResumeUpstream => {
                 self.console_control
-                    .send(ConsoleControl::ResumeUpstream)
-                    .await?
+                    .send(ConsoleControl::ResumeUpstream)?
             }
             ControlMessage::CursorToSpecificId(newid) => {
                 log::info!("  explicit cursor set to {}", newid);
@@ -430,14 +431,12 @@ impl ServeClient {
             }
             ControlMessage::WriteConfig(new_config) => {
                 self.console_control
-                    .send(ConsoleControl::WriteConfig(new_config))
-                    .await?
+                    .send(ConsoleControl::WriteConfig(new_config))?
             }
             ControlMessage::ReadConfig => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.console_control
-                    .send(ConsoleControl::ReadConfig(tx))
-                    .await?;
+                    .send(ConsoleControl::ReadConfig(tx))?;
                 let cc = rx.await?;
                 self.ws
                     .send(WebsocketMessage::Text(serde_json::to_string(&Message {
@@ -461,7 +460,7 @@ pub struct UpstreamStats(std::sync::Mutex<UpstreamStatsBuffer>);
 pub async fn main_actor(
     config_filename: PathBuf,
     db: &sled::Db,
-    mut rx: Receiver<ConsoleControl>,
+    mut rx: UnboundedReceiver<ConsoleControl>,
 ) -> anyhow::Result<()> {
     let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
         last_update: None,
@@ -684,7 +683,7 @@ impl UpstreamStats {
 async fn socket_listener(
     listen_addr: SocketAddr,
     db: &sled::Db,
-    console: Sender<ConsoleControl>,
+    console: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
@@ -729,6 +728,28 @@ fn write_config(config_file: &std::path::Path, config: &ClientConfig) -> anyhow:
     Ok(())
 }
 
+pub async fn database_capper(db: sled::Db, size_cap: u64) -> anyhow::Result<()> {
+    loop {
+        let dbsz = db.size_on_disk()?;
+        log::debug!("Size capper db size report: {}", dbsz);
+        if dbsz > size_cap {
+            log::info!("Triggering database trimmer");
+            let (minid, maxid) = match get_first_last_id(&db)? {
+                (Some(a), Some(b)) => (a,b),
+                _ => continue,
+            };
+            let len = maxid - minid;
+            // remove 10% of data
+            for k in minid..(minid+(len/10)) {
+                let _ =db.remove(k.to_be_bytes())?;
+            }
+            tokio::time::sleep(Duration::new(1, 0)).await;
+        } else {
+            tokio::time::sleep(Duration::new(10, 0)).await;
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -755,7 +776,19 @@ fn main() -> anyhow::Result<()> {
         .enable_time()
         .build()?;
 
-    let (tx, rx) = tokio::sync::mpsc::channel(3);
+
+    if let Some(size_cap) = opts.max_database_size {
+        let db__ = db.clone();  
+        rt.spawn(async move {
+            if let Err(e) = database_capper(db__, size_cap).await {
+                log::error!("Database capper: {}", e);
+                log::error!("Database capper errors are critical. Exiting.");
+                std::process::exit(33);
+            }
+        });
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     let db_ = db.clone();
     let listen_addr = opts.listen_addr;
