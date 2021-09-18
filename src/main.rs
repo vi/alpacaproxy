@@ -455,6 +455,7 @@ pub async fn main_actor(
     config_filename: PathBuf,
     db: &sled::Db,
     mut rx: UnboundedReceiver<ConsoleControl>,
+    size_cap: Option<u64>,
 ) -> anyhow::Result<()> {
     let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
         last_update: None,
@@ -465,7 +466,7 @@ pub async fn main_actor(
     let mut upstream = Some(tokio::spawn(
         upstream_stats
             .clone()
-            .connect_upstream(config_filename.clone(), db.clone()),
+            .connect_upstream(config_filename.clone(), db.clone(), size_cap),
     ));
 
     let mut num_clients = 0usize;
@@ -512,7 +513,7 @@ pub async fn main_actor(
                 upstream = Some(tokio::spawn(
                     upstream_stats
                         .clone()
-                        .connect_upstream(config_filename.clone(), db.clone()),
+                        .connect_upstream(config_filename.clone(), db.clone(), size_cap),
                 ));
             }
             ConsoleControl::PauseUpstream | ConsoleControl::ResumeUpstream => {
@@ -532,7 +533,7 @@ pub async fn main_actor(
 }
 
 impl UpstreamStats {
-    async fn connect_upstream(self: Arc<Self>, config_filename: PathBuf, db: sled::Db) -> () {
+    async fn connect_upstream(self: Arc<Self>, config_filename: PathBuf, db: sled::Db, size_cap: Option<u64>) -> () {
         let config: ClientConfig = match read_config(&config_filename) {
             Ok(x) => x,
             Err(e) => {
@@ -544,7 +545,7 @@ impl UpstreamStats {
             loop {
                 if let Err(e) = self
                     .clone()
-                    .handle_upstream(&uri, &config.startup_messages, config.automirror, &db)
+                    .handle_upstream(&uri, &config.startup_messages, config.automirror, &db, size_cap)
                     .await
                 {
                     log::error!("Handling upstream connection existed with error: {}", e);
@@ -566,6 +567,7 @@ impl UpstreamStats {
         startup_messages: &[serde_json::Value],
         automirror: bool,
         db: &sled::Db,
+        size_cap: Option<u64>,
     ) -> anyhow::Result<()> {
         log::debug!("Establishing upstream connection 1");
         let (mut upstream, _) = tokio_tungstenite::connect_async(uri).await?;
@@ -600,8 +602,9 @@ impl UpstreamStats {
         log::debug!("Establishing upstream connection 3");
 
         let mut nextkey = get_next_db_key(&db)?;
+        let mut slowdown_mode = false;
 
-        let mut handle_msg = |msg: Message| -> anyhow::Result<bool> {
+        let mut handle_msg = |msg: Message| -> anyhow::Result<(bool, bool)> {
             match &msg.stream[..] {
                 "listening" => {
                     log::info!("Established upstream connection");
@@ -625,6 +628,7 @@ impl UpstreamStats {
                 x if x.starts_with("AM.") => {
                     log::debug!("Received minutely update for {}", x);
                     let mut do_yield = false;
+                    let mut do_consider_db_size = false;
                     {
                         let mut stats = self.0.lock().unwrap();
                         stats.last_update = Some(Instant::now());
@@ -632,21 +636,38 @@ impl UpstreamStats {
                         if stats.received_tickers % 50 == 0 {
                             do_yield = true;
                         }
+                        if stats.received_tickers % 1000 == 0 {
+                            do_consider_db_size = true;
+                        }
+                    }
+                    if let Some(size_cap) = size_cap {
+                        if do_consider_db_size {
+                            let dbsz = db.size_on_disk()?;
+                            if dbsz > size_cap*2 {
+                                log::warn!("Slowing down reading from upstream due to database overflow");
+                                slowdown_mode = true;
+                            } else {
+                                if slowdown_mode {
+                                    log::info!("No longer slowing down reads");
+                                }
+                                slowdown_mode = false;
+                            }
+                        }
                     }
                     
                     db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
                     nextkey = nextkey.checked_add(1).context("Key space is full")?;
-                    return Ok(do_yield); 
+                    return Ok((do_yield, slowdown_mode)); 
                 }
                 x => {
                     log::warn!("Strange message from upstram of type {}", x);
                 }
             }
-            Ok(false)
+            Ok((false, slowdown_mode))
         };
 
         while let Some(msg) = upstream.next().await {
-            let do_yield = match msg {
+            let (do_yield, slowdown_mode) = match msg {
                 Ok(WebsocketMessage::Text(msg)) => handle_msg(serde_json::from_str(&msg)?)?,
                 Ok(WebsocketMessage::Binary(msg)) => handle_msg(serde_json::from_slice(&msg)?)?,
                 Ok(WebsocketMessage::Close(c)) => {
@@ -655,19 +676,22 @@ impl UpstreamStats {
                 }
                 Ok(WebsocketMessage::Ping(_)) => {
                     log::debug!("WebSocket ping from upstream");
-                    false
+                    (false, false)
                 }
                 Ok(_) => {
                     log::warn!("other WebSocket message from upstream");
-                    false
+                    (false, false)
                 }
                 Err(e) => {
                     log::error!("From upstream websocket: {}", e);
-                    false
+                    (false, false)
                 }
             };
             if do_yield {
                 tokio::task::yield_now().await;
+            }
+            if slowdown_mode {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         Ok(())
@@ -746,21 +770,24 @@ fn write_config(config_file: &std::path::Path, config: &ClientConfig) -> anyhow:
 }
 
 pub async fn database_capper(db: sled::Db, size_cap: u64) -> anyhow::Result<()> {
+    let mut cached_db_size = 0;
     loop {
         let dbsz = db.size_on_disk()?;
         log::debug!("Size capper db size report: {}", dbsz);
-        if dbsz > size_cap {
+        if dbsz > size_cap && dbsz != cached_db_size {
             log::debug!("Considering database trimmer");
             let (minid, maxid) = match get_first_last_id(&db)? {
                 (Some(a), Some(b)) => (a,b),
                 _ => continue,
             };
-            let len = maxid - minid;
+            let mut len = maxid - minid;
             if len > 10000 {
                 log::info!("Triggering database trimmer");
+            } else {
+                continue;
             }
-            // remove 10% of data
-            for k in minid..(minid+(len/10)) {
+            len = (len as f32 * (1.0 - size_cap as f32 / dbsz as f32)) as u64; 
+            for k in minid..(minid+len) {
                 let _ =db.remove(k.to_be_bytes())?;
                 if k % 100 == 0 {
                     tokio::task::yield_now().await;
@@ -769,7 +796,9 @@ pub async fn database_capper(db: sled::Db, size_cap: u64) -> anyhow::Result<()> 
             let _ = db.flush_async().await;
             log::debug!("Trimmer run finished");
             tokio::time::sleep(Duration::new(1, 0)).await;
+            cached_db_size = dbsz;
         } else {
+            cached_db_size = dbsz;
             tokio::time::sleep(Duration::new(10, 0)).await;
         }
     }
@@ -824,7 +853,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    let ret = rt.block_on(main_actor(opts.client_config, &db, rx));
+    let ret = rt.block_on(main_actor(opts.client_config, &db, rx, opts.max_database_size));
     rt.shutdown_timeout(Duration::from_millis(100));
     ret
 }
