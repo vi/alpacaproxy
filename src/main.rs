@@ -33,7 +33,7 @@ struct Message {
 
 #[derive(serde_derive::Serialize, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
-enum UpstreamStatus {
+pub enum UpstreamStatus {
     Disabled,
     Paused,
     Connecting,
@@ -61,6 +61,7 @@ pub enum ConsoleControl {
     ClientDisconnected,
     WriteConfig(ClientConfig),
     ReadConfig(OneshotSender<ClientConfig>),
+    GetUpstreamState(OneshotSender<UpstreamStatus>),
 }
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
@@ -138,7 +139,7 @@ enum ControlMessage {
 struct ServeClient {
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     db: sled::Db,
-    cursor: u64,
+    cursor: Option<u64>,
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
     console_control: Sender<ConsoleControl>,
     require_password: Option<String>,
@@ -151,12 +152,11 @@ async fn serve_client(
     require_password: Option<String>,
 ) -> anyhow::Result<()> {
     let ws = tokio_tungstenite::accept_async(client_socket).await?;
-    let cursor = get_next_db_key(db)?;
     let cc2 = console_control.clone();
     let c = ServeClient {
         ws,
         db: db.clone(),
-        cursor,
+        cursor: None,
         filter: None,
         console_control,
         require_password,
@@ -168,11 +168,40 @@ async fn serve_client(
 }
 
 impl ServeClient {
+    async fn get_cursor(&mut self) -> anyhow::Result<u64> {
+        if let Some(c) = self.cursor {
+            return Ok(c);
+        }
+        loop {
+            let (tx,rx) = tokio::sync::oneshot::channel();
+            self.console_control.send(ConsoleControl::GetUpstreamState(tx)).await?;
+            let upstream_status = rx.await?;
+            match upstream_status {
+                UpstreamStatus::Disabled => break,
+                UpstreamStatus::Paused => break,
+                UpstreamStatus::Connecting => (),
+                UpstreamStatus::Connected => break,
+                UpstreamStatus::Mirroring => (),
+            }
+            log::warn!("  waiting for proper status before initializing cursor, now {:?}", upstream_status);
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+        }
+        self.cursor = Some(get_next_db_key(&self.db)?);
+        Ok(self.cursor.unwrap())
+    }
+
     async fn run(mut self) -> anyhow::Result<()> {
+        let upstream_status;
+        {
+            let (tx,rx) = tokio::sync::oneshot::channel();
+            self.console_control.send(ConsoleControl::GetUpstreamState(tx)).await?;
+            upstream_status = rx.await?;
+        }
+
         {
             let buf = serde_json::to_string(&Message {
                 stream: "hello".to_owned(),
-                data: serde_json::Value::Null,
+                data: serde_json::to_value(upstream_status)?,
             })
             .unwrap();
             self.ws.send(WebsocketMessage::Text(buf)).await?;
@@ -279,8 +308,9 @@ impl ServeClient {
         }
         match msg {
             ControlMessage::Preroll(num) => {
-                let start = self.cursor.saturating_sub(num);
-                let rangeend = get_first_last_id(&self.db)?.1.unwrap_or(self.cursor);
+                let cursor = self.get_cursor().await?;
+                let start = cursor.saturating_sub(num);
+                let rangeend = get_first_last_id(&self.db)?.1.unwrap_or(cursor);
                 let range = start..=rangeend;
                 log::info!("  prerolling {} messages for the client, really {}", num, rangeend+1-start);
                 self.preroller(range).await?;
@@ -293,9 +323,10 @@ impl ServeClient {
                     self.ws.send(WebsocketMessage::Text(buf)).await?;
                 }
                 log::debug!("  prerolling finished");
-                self.cursor = rangeend+1;
+                self.cursor = Some(rangeend+1);
             }
             ControlMessage::Monitor => {
+                let _ = self.get_cursor().await?;
                 log::info!("  streaming messages for the client");
                 let mut watcher = self.db.watch_prefix(vec![]);
 
@@ -305,10 +336,11 @@ impl ServeClient {
                         sled::Event::Insert { key, value } => {
                             let key: Result<[u8; 8], _> = key.as_ref().try_into();
                             if let Ok(key) = key {
-                                let key = u64::from_be_bytes(key);
-                                self.preroller(self.cursor..key).await?;
+                                let key = u64::from_be_bytes(key); // initialized by get_cursor above
+                                let cursor = self.cursor.unwrap();
+                                self.preroller(cursor..key).await?;
                                 self.datum(value, key).await?;
-                                self.cursor = key.saturating_add(1);
+                                self.cursor = Some(key.saturating_add(1));
                             }
                         }
                         sled::Event::Remove { key: _ } => (),
@@ -319,7 +351,8 @@ impl ServeClient {
             ControlMessage::RemoveRetainingLastN(num) => {
                 log::info!("  retaining {} last samples in the database", num);
                 let first = (0u64).to_be_bytes();
-                let last = self.cursor.saturating_sub(num).to_be_bytes();
+                let cursor = self.get_cursor().await?;
+                let last = cursor.saturating_sub(num).to_be_bytes();
                 let mut ctr = 0u64;
                 for x in self.db.range(first..last) {
                     if let Ok((key, _val)) = x {
@@ -380,7 +413,7 @@ impl ServeClient {
             }
             ControlMessage::CursorToSpecificId(newid) => {
                 log::info!("  explicit cursor set to {}", newid);
-                self.cursor = newid;
+                self.cursor = Some(newid);
             }
             ControlMessage::Password(supplied_password) => {
                 if let Some(required_password) = self.require_password.take() {
@@ -466,6 +499,12 @@ pub async fn main_actor(
                     last_datum_id,
                     new_tickers_this_session: stats.received_tickers,
                 };
+                drop(stats);
+                let _ = tx.send(ss);
+            }
+            ConsoleControl::GetUpstreamState(tx) => {
+                let stats = upstream_stats.0.lock().unwrap();
+                let ss = stats.status;
                 drop(stats);
                 let _ = tx.send(ss);
             }
