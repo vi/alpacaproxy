@@ -8,6 +8,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 #[allow(unused_imports)]
 use tokio::sync::oneshot::{Receiver as OneshotReceiver, Sender as OneshotSender};
+#[allow(unused_imports)]
+use tokio::sync::watch::{Sender as WatchSender, Receiver as WatchReceiver};
 use tokio::time::Instant;
 
 use tokio_tungstenite::tungstenite::Message as WebsocketMessage;
@@ -147,6 +149,7 @@ struct ServeClient {
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
     console_control: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
+    db_watcher: WatchReceiver<u64>,
 }
 
 async fn serve_client(
@@ -154,6 +157,7 @@ async fn serve_client(
     db: &sled::Db,
     console_control: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
+    db_watcher: WatchReceiver<u64>,
 ) -> anyhow::Result<()> {
     let ws = tokio_tungstenite::accept_async(client_socket).await?;
     let cc2 = console_control.clone();
@@ -164,6 +168,7 @@ async fn serve_client(
         filter: None,
         console_control,
         require_password,
+        db_watcher,
     };
     let _ = cc2.send(ConsoleControl::ClientConnected);
     let ret = c.run().await;
@@ -332,25 +337,14 @@ impl ServeClient {
             ControlMessage::Monitor => {
                 let _ = self.get_cursor().await?;
                 log::info!("  streaming messages for the client");
-                let mut watcher = self.db.watch_prefix(vec![]);
 
-                // https://github.com/spacejam/sled/issues/1368
-                while let Some(evt) = (&mut watcher).await {
-                    match evt {
-                        sled::Event::Insert { key, value } => {
-                            let key: Result<[u8; 8], _> = key.as_ref().try_into();
-                            if let Ok(key) = key {
-                                let key = u64::from_be_bytes(key); // initialized by get_cursor above
-                                let cursor = self.cursor.unwrap();
-                                self.preroller(cursor..key).await?;
-                                self.datum(value, key).await?;
-                                self.cursor = Some(key.saturating_add(1));
-                            }
-                        }
-                        sled::Event::Remove { key: _ } => (),
-                    }
+                loop {
+                    self.db_watcher.changed().await?;
+                    let key = *self.db_watcher.borrow_and_update();
+                    let cursor = self.cursor.unwrap();
+                    self.preroller(cursor..(key+1)).await?;
+                    self.cursor = Some(key.saturating_add(1));
                 }
-                log::debug!("  streaming messages finished");
             }
             ControlMessage::RemoveRetainingLastN(num) => {
                 log::info!("  retaining {} last samples in the database", num);
@@ -690,6 +684,28 @@ async fn socket_listener(
 
     log::debug!("Created listening socket");
 
+    let (tx, db_watcher) = tokio::sync::watch::channel(0);
+
+    let db_ = db.clone();
+    std::thread::spawn(move || {
+        // Sled has async watcher, but it is very easy to cause a deadlock with it.
+        let watcher = db_.watch_prefix(vec![]);
+        for ev in watcher {
+            match ev {
+                sled::Event::Insert { key, value: _, } => {
+                    let key: Result<[u8; 8], _> = key.as_ref().try_into();
+                    if let Ok(key) = key {
+                        let key = u64::from_be_bytes(key);
+                        if let Err(_e) = tx.send(key) {
+                            return;
+                        }
+                    }
+                }
+                sled::Event::Remove { key: _ } => (),
+            }
+        }
+    });
+
     loop {
         match listener.accept().await {
             Ok((client_socket, addr)) => {
@@ -697,9 +713,10 @@ async fn socket_listener(
                 let db__ = db.clone();
                 let consctrl = console.clone();
                 let require_password = require_password.clone();
+                let db_watcher = db_watcher.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        serve_client(client_socket, &db__, consctrl, require_password).await
+                        serve_client(client_socket, &db__, consctrl, require_password, db_watcher).await
                     {
                         log::error!("Error serving client: {}", e);
                     }
@@ -733,16 +750,24 @@ pub async fn database_capper(db: sled::Db, size_cap: u64) -> anyhow::Result<()> 
         let dbsz = db.size_on_disk()?;
         log::debug!("Size capper db size report: {}", dbsz);
         if dbsz > size_cap {
-            log::info!("Triggering database trimmer");
+            log::debug!("Considering database trimmer");
             let (minid, maxid) = match get_first_last_id(&db)? {
                 (Some(a), Some(b)) => (a,b),
                 _ => continue,
             };
             let len = maxid - minid;
+            if len > 10000 {
+                log::info!("Triggering database trimmer");
+            }
             // remove 10% of data
             for k in minid..(minid+(len/10)) {
                 let _ =db.remove(k.to_be_bytes())?;
+                if k % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
+            let _ = db.flush_async().await;
+            log::debug!("Trimmer run finished");
             tokio::time::sleep(Duration::new(1, 0)).await;
         } else {
             tokio::time::sleep(Duration::new(10, 0)).await;
