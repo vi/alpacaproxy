@@ -346,8 +346,12 @@ impl ServeClient {
                     self.db_watcher.changed().await?;
                     let key = *self.db_watcher.borrow_and_update();
                     let cursor = self.cursor.unwrap();
-                    self.preroller(cursor..(key+1)).await?;
-                    self.cursor = Some(key.saturating_add(1));
+                    let range = cursor..=key;
+                    log::debug!("    range {:?}", range);
+                    if ! range.is_empty() {
+                        self.preroller(cursor..=key).await?;
+                        self.cursor = Some(key.saturating_add(1));
+                    }
                 }
             }
             ControlMessage::RemoveRetainingLastN(num) => {
