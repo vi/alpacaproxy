@@ -460,6 +460,7 @@ pub async fn main_actor(
     db: &sled::Db,
     mut rx: UnboundedReceiver<ConsoleControl>,
     size_cap: Option<u64>,
+    watcher_tx: WatchSender<u64>,
 ) -> anyhow::Result<()> {
     let upstream_stats = Arc::new(UpstreamStats(std::sync::Mutex::new(UpstreamStatsBuffer {
         last_update: None,
@@ -467,10 +468,20 @@ pub async fn main_actor(
         received_tickers: 0,
     })));
 
+    // converter between WatchSender and UnboundedSender
+    let (watcher_sender, mut watcher_receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(msg) = watcher_receiver.recv().await {
+            if watcher_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut upstream = Some(tokio::spawn(
         upstream_stats
             .clone()
-            .connect_upstream(config_filename.clone(), db.clone(), size_cap),
+            .connect_upstream(config_filename.clone(), db.clone(), size_cap, watcher_sender.clone()),
     ));
 
     let mut num_clients = 0usize;
@@ -517,7 +528,7 @@ pub async fn main_actor(
                 upstream = Some(tokio::spawn(
                     upstream_stats
                         .clone()
-                        .connect_upstream(config_filename.clone(), db.clone(), size_cap),
+                        .connect_upstream(config_filename.clone(), db.clone(), size_cap, watcher_sender.clone()),
                 ));
             }
             ConsoleControl::PauseUpstream | ConsoleControl::ResumeUpstream => {
@@ -537,7 +548,7 @@ pub async fn main_actor(
 }
 
 impl UpstreamStats {
-    async fn connect_upstream(self: Arc<Self>, config_filename: PathBuf, db: sled::Db, size_cap: Option<u64>) -> () {
+    async fn connect_upstream(self: Arc<Self>, config_filename: PathBuf, db: sled::Db, size_cap: Option<u64>, watcher_tx: UnboundedSender<u64>) -> () {
         let config: ClientConfig = match read_config(&config_filename) {
             Ok(x) => x,
             Err(e) => {
@@ -549,7 +560,7 @@ impl UpstreamStats {
             loop {
                 if let Err(e) = self
                     .clone()
-                    .handle_upstream(&uri, &config.startup_messages, config.automirror, &db, size_cap)
+                    .handle_upstream(&uri, &config.startup_messages, config.automirror, &db, size_cap, watcher_tx.clone())
                     .await
                 {
                     log::error!("Handling upstream connection existed with error: {}", e);
@@ -572,6 +583,7 @@ impl UpstreamStats {
         automirror: bool,
         db: &sled::Db,
         size_cap: Option<u64>,
+        watcher_tx: UnboundedSender<u64>,
     ) -> anyhow::Result<()> {
         log::debug!("Establishing upstream connection 1");
         let (mut upstream, _) = tokio_tungstenite::connect_async(uri).await?;
@@ -660,6 +672,7 @@ impl UpstreamStats {
                     }
                     
                     db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
+                    let _ = watcher_tx.send(nextkey);
                     nextkey = nextkey.checked_add(1).context("Key space is full")?;
                     return Ok((do_yield, slowdown_mode)); 
                 }
@@ -707,32 +720,11 @@ async fn socket_listener(
     db: &sled::Db,
     console: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
+    watcher_rx: WatchReceiver<u64>
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     log::debug!("Created listening socket");
-
-    let (tx, db_watcher) = tokio::sync::watch::channel(0);
-
-    let db_ = db.clone();
-    std::thread::spawn(move || {
-        // Sled has async watcher, but it is very easy to cause a deadlock with it.
-        let watcher = db_.watch_prefix(vec![]);
-        for ev in watcher {
-            match ev {
-                sled::Event::Insert { key, value: _, } => {
-                    let key: Result<[u8; 8], _> = key.as_ref().try_into();
-                    if let Ok(key) = key {
-                        let key = u64::from_be_bytes(key);
-                        if let Err(_e) = tx.send(key) {
-                            return;
-                        }
-                    }
-                }
-                sled::Event::Remove { key: _ } => (),
-            }
-        }
-    });
 
     loop {
         match listener.accept().await {
@@ -741,7 +733,7 @@ async fn socket_listener(
                 let db__ = db.clone();
                 let consctrl = console.clone();
                 let require_password = require_password.clone();
-                let db_watcher = db_watcher.clone();
+                let db_watcher = watcher_rx.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
                         serve_client(client_socket, &db__, consctrl, require_password, db_watcher).await
@@ -835,6 +827,9 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
 
+    let (watcher_tx, watcher_rx) = tokio::sync::watch::channel(0);
+
+
     if let Some(size_cap) = opts.max_database_size {
         let db__ = db.clone();  
         let database_size_checkup_interval_secs = opts.database_size_checkup_interval_secs;
@@ -852,13 +847,13 @@ fn main() -> anyhow::Result<()> {
     let db_ = db.clone();
     let listen_addr = opts.listen_addr;
     rt.spawn(async move {
-        if let Err(e) = socket_listener(listen_addr, &db_, tx, first_config.require_password).await
+        if let Err(e) = socket_listener(listen_addr, &db_, tx, first_config.require_password, watcher_rx).await
         {
             log::error!("Socket listener: {}", e);
         }
     });
 
-    let ret = rt.block_on(main_actor(opts.client_config, &db, rx, opts.max_database_size));
+    let ret = rt.block_on(main_actor(opts.client_config, &db, rx, opts.max_database_size, watcher_tx));
     rt.shutdown_timeout(Duration::from_millis(100));
     ret
 }
