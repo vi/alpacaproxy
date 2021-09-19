@@ -137,3 +137,28 @@ label span {
 .serverstatus_MirroringNoTU { background: #8ac; }
 .serverstatus_MirroringNoRecv:after { content: "Mirroring?\00000A(2 minutes without new data)"; }
 .serverstatus_MirroringNoRecv { background: #8ac; }
+
+.showrawstatus {
+    margin-top: 20px;
+    display: block;
+}
+
+.nicestatus {
+    background: #cef;
+    border: solid 1px;
+}
+.nicestatus div {
+    background: #cef;
+    margin-left: 12px;
+}
+.nicestatus div :first-child {
+    display: inline-block;
+    min-width: 150px;
+}
+.nicestatus div :nth-child(2) {
+    display: inline-block;
+    min-width: 150px;
+}
+.nicestatus .val {
+    font-weight: bold;
+}

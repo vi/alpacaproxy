@@ -49,6 +49,7 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
         config: "".to_owned(),
         allow_sending_status_inquiries: true,
         conn_status: ConnStatus::Disconnected,
+        show_raw_status: false,
     }
 }
 
@@ -69,6 +70,7 @@ struct Model {
     config: String,
     allow_sending_status_inquiries: bool,
     conn_status: ConnStatus,
+    show_raw_status: bool,
 }
 
 
@@ -162,6 +164,7 @@ enum Msg {
     WriteConfig,
     ToggleVisiblePassword,
     AutoConnectAndFocusPassword,
+    ToggleShowRawStatus,
 }
 
 fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
@@ -334,6 +337,7 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
             }
             return update(Msg::ToggleConnectWs, model, orders);
         }
+        Msg::ToggleShowRawStatus => model.show_raw_status ^= true,
     }
     html_document().set_title(match model.conn_status {
         ConnStatus::Disconnected => "WsPrx: diconnected",
@@ -497,13 +501,57 @@ fn view(model: &Model) -> Node<Msg> {
         ],
         div![
             C!["systemstatus"],
-            pre![
-                if let Some(ss) = &model.status {
-                    format!("{:#?}", ss)
-                } else {
-                    "Not connected".to_owned()
-                }
+            if let Some(st) = &model.status {
+                div![
+                    C!["nicestatus"],
+                    div![
+                        span!["Database size:"],
+                        span![C!["val"], format!("{}B", size_format::SizeFormatterBinary::new(st.database_size))],
+                        if let (Some(start), Some(end)) = (st.first_datum_id, st.last_datum_id) {
+                            span![format!(" ({} samples, {} new)",  end+1-start, st.new_tickers_this_session)]
+                        } else {
+                            span![]
+                        }
+                    ],
+                    div![
+                        span!["Server version:"],
+                        span![C!["val"], &st.server_version],
+                        span!["Clients currently connected:"],
+                        span![C!["val"], st.clients_connected],
+                    ],
+                    if let Some(ltr) = st.last_ticker_update_ms {
+                        div![
+                            span!["Last sample received "],
+                            span![C!["val"], timeago::Formatter::new().convert(std::time::Duration::from_millis(ltr))],
+                        ]
+                    } else {
+                        div!["Waiting for the first sample to arrive"]
+                    },
+                ]
+            } else {
+                div![C!["nonicestatus"]]
+            },
+           
+            label![
+                C!["showrawstatus"],
+                "Show raw status",
+                input![
+                    attrs!{At::Type => "checkbox", At::Checked => model.show_raw_status.as_at_value()},
+                    ev(Ev::Change, |_| Msg::ToggleShowRawStatus),
+                ],
             ],
+            if model.show_raw_status {
+                pre![
+                    C!["rawstatus"],
+                    if let Some(ss) = &model.status {
+                        format!("{:#?}", ss)
+                    } else {
+                        "Not connected".to_owned()
+                    }
+                ]
+            } else {
+                pre![]
+            },
         ],
     ]
 }
