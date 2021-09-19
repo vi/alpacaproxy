@@ -84,6 +84,7 @@ label span {
     color: red;
     height: 30px;
     margin-left: 30px;
+    font-family: monospace;
 }
 
 .mainstatus div {
@@ -147,8 +148,7 @@ label span {
     background: #cef;
     border: solid 1px;
 }
-.nicestatus div {
-    background: #cef;
+.nicestatus span {
     margin-left: 12px;
 }
 .nicestatus div :first-child {

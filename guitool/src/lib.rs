@@ -236,12 +236,14 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
     match msg {
         Msg::SecondlyUpdate => {
             if let Some(ws) = model.ws.as_ref() {
-                if model.allow_sending_status_inquiries {
-                    let _ = ws.send_json(&ControlMessage::Status);
-                    model.allow_sending_status_inquiries = false;
-                } else {
-                    model.conn_status = ConnStatus::Lagging;
-                }
+                if ! matches!(model.conn_status, ConnStatus::Unauthenticated) {
+                    if model.allow_sending_status_inquiries {
+                        let _ = ws.send_json(&ControlMessage::Status);
+                        model.allow_sending_status_inquiries = false;
+                    } else {
+                        model.conn_status = ConnStatus::Lagging;
+                    }
+                } 
             }
         }
         Msg::UpdateWsUrl(x) => model.wsurl = x,
@@ -291,7 +293,9 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
         Msg::UpdatePassword(x) => model.password = x,
         Msg::SendPassword => {
             let _ = LocalStorage::insert("password", &model.password);
-            send_ws(ControlMessage::Password(model.password.clone()), model, orders)
+            send_ws(ControlMessage::Password(model.password.clone()), model, orders);
+            model.conn_status=ConnStatus::Connected;
+            model.allow_sending_status_inquiries = true;
         },
         Msg::ToggleAllowServerShutdown => {
             model.allow_shutdown = !model.allow_shutdown;
