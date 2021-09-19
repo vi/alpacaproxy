@@ -44,6 +44,9 @@ struct Opts {
 struct Message {
     stream: String,
     data: serde_json::Value,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
 }
 
 #[derive(serde_derive::Serialize, Clone, Copy, Debug)]
@@ -150,6 +153,7 @@ enum ControlMessage {
     Password(String),
     WriteConfig(ClientConfig),
     ReadConfig,
+    PleaseIncludeIds,
 }
 
 struct ServeClient {
@@ -160,6 +164,7 @@ struct ServeClient {
     console_control: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
     db_watcher: WatchReceiver<u64>,
+    include_ids: bool,
 }
 
 async fn serve_client(
@@ -179,6 +184,7 @@ async fn serve_client(
         console_control,
         require_password,
         db_watcher,
+        include_ids: false,
     };
     let _ = cc2.send(ConsoleControl::ClientConnected);
     let ret = c.run().await;
@@ -221,6 +227,7 @@ impl ServeClient {
             let buf = serde_json::to_string(&Message {
                 stream: "hello".to_owned(),
                 data: serde_json::to_value(upstream_status)?,
+                id: None,
             })
             .unwrap();
             self.ws.send(WebsocketMessage::Text(buf)).await?;
@@ -273,6 +280,7 @@ impl ServeClient {
                 serde_json::to_string(&Message {
                     stream: "error".to_owned(),
                     data: serde_json::Value::String(x),
+                    id: None,
                 })
                 .unwrap(),
             ))
@@ -300,6 +308,7 @@ impl ServeClient {
         let msg = Message {
             stream,
             data: serde_json::to_value(minutely)?,
+            id: if self.include_ids { Some(id) } else { None }, 
         };
         self.ws
             .send(WebsocketMessage::Text(serde_json::to_string(&msg)?))
@@ -337,6 +346,7 @@ impl ServeClient {
                     let buf = serde_json::to_string(&Message {
                         stream: "preroll_finished".to_owned(),
                         data: serde_json::Value::Null,
+                        id: None,
                     })
                     .unwrap();
                     self.ws.send(WebsocketMessage::Text(buf)).await?;
@@ -382,6 +392,7 @@ impl ServeClient {
                     let buf = serde_json::to_string(&Message {
                         stream: "remove_finished".to_owned(),
                         data: serde_json::Value::Number(ctr.into()),
+                        id: None,
                     })
                     .unwrap();
                     self.ws.send(WebsocketMessage::Text(buf)).await?;
@@ -392,6 +403,7 @@ impl ServeClient {
                 let buf = serde_json::to_string(&Message {
                     stream: "database_size".to_owned(),
                     data: serde_json::Value::Number(self.db.size_on_disk()?.into()),
+                    id: None,
                 })
                 .unwrap();
                 self.ws.send(WebsocketMessage::Text(buf)).await?;
@@ -408,6 +420,7 @@ impl ServeClient {
                     .send(WebsocketMessage::Text(serde_json::to_string(&Message {
                         stream: "stats".to_owned(),
                         data: serde_json::to_value(ss)?,
+                        id: None,
                     })?))
                     .await?;
             }
@@ -450,8 +463,12 @@ impl ServeClient {
                     .send(WebsocketMessage::Text(serde_json::to_string(&Message {
                         stream: "config".to_owned(),
                         data: serde_json::to_value(cc)?,
+                        id: None,
                     })?))
                     .await?;
+            }
+            ControlMessage::PleaseIncludeIds => {
+                self.include_ids = true;
             }
         }
         Ok(())
@@ -612,6 +629,11 @@ impl UpstreamStats {
             };
             upstream
                 .send(WebsocketMessage::Text(serde_json::to_string(
+                    &ControlMessage::PleaseIncludeIds,
+                )?))
+                .await?;
+            upstream
+                .send(WebsocketMessage::Text(serde_json::to_string(
                     &ControlMessage::CursorToSpecificId(cursor),
                 )?))
                 .await?;
@@ -681,6 +703,9 @@ impl UpstreamStats {
                             }
                         }
                     }
+                    if let Some(newid) = msg.id {
+                        nextkey = newid;
+                    } 
                     
                     db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
                     let _ = watcher_tx.send(nextkey);
