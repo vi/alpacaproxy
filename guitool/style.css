@@ -75,3 +75,58 @@ label span {
     min-width: 680px;
     min-height: 200px;
 }
+
+.errormsg {
+    color: red;
+    height: 30px;
+    margin-left: 30px;
+}
+
+.mainstatus div {
+    display: inline-flex;
+    min-height: 36px;
+    border: solid 1px;
+    margin-left: 10px;
+    padding-left: 10px;
+    padding-top: 10px;
+    white-space: pre-wrap;
+}
+.mainstatus .connstatus {
+    width: 250px;
+}
+.mainstatus .serverstatus {
+    width: 400px;
+}
+.connstatus:before {
+    content: "Connection to server:";
+    margin-right: 10px;
+}
+.connstatus_Disconnected:after { content: "Disconnected"; }
+.connstatus_Disconnected {  background: #fcc;  }
+.connstatus_Lagging:after { content: "Lagging"; }
+.connstatus_Lagging { background: #ff8; }
+.connstatus_Connected:after { content: "Connected"; }
+.connstatus_Connected { background: #8f8; }
+
+.serverstatus:before {
+    content: "Server upstream:";
+    margin-right: 10px;
+}
+.serverstatus_Connected:after { content: "Connected"; }
+.serverstatus_Connected { background: #8f8; }
+.serverstatus_ConnectedNoTU:after { content: "Idling\00000A(not received any update yet)"; }
+.serverstatus_ConnectedNoTU { background: #8ca; }
+.serverstatus_ConnectedNoRecv:after { content: "Idling\00000A(2 minutes without new data)"; }
+.serverstatus_ConnectedNoRecv { background: #8ca; }
+.serverstatus_Disabled:after { content: "Not configured"; }
+.serverstatus_Disabled {  background: #fcc;  }
+.serverstatus_Paused:after { content: "Paused"; }
+.serverstatus_Paused { background: #ccc; }
+.serverstatus_Connecting:after { content: "Connecting"; }
+.serverstatus_Connecting { background: #ff8; }
+.serverstatus_Mirroring:after { content: "Mirroring"; }
+.serverstatus_Mirroring { background: #8cf; }
+.serverstatus_MirroringNoTU:after { content: "Mirroring?\00000A(not received any update yet)"; }
+.serverstatus_MirroringNoTU { background: #8ac; }
+.serverstatus_MirroringNoRecv:after { content: "Mirroring?\00000A(2 minutes without new data)"; }
+.serverstatus_MirroringNoRecv { background: #8ac; }

@@ -22,6 +22,8 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
         allow_shutdown: false,
         show_config_editor: false,
         config: "".to_owned(),
+        allow_sending_status_inquiries: true,
+        conn_status: ConnStatus::Disconnected,
     }
 }
 
@@ -40,6 +42,16 @@ struct Model {
     show_config_editor: bool,
     visible_password: bool,
     config: String,
+    allow_sending_status_inquiries: bool,
+    conn_status: ConnStatus,
+}
+
+
+#[derive(Debug)]
+enum ConnStatus {
+    Disconnected,
+    Connected,
+    Lagging,
 }
 
 #[derive(serde_derive::Deserialize, Clone, Copy, Debug)]
@@ -62,6 +74,9 @@ pub struct SystemStatus {
     upstream_status: UpstreamStatus,
     new_tickers_this_session: usize,
     server_version: String,
+
+    #[serde(flatten)]
+    rest: serde_json::Value,
 }
 
 #[derive(serde_derive::Serialize)]
@@ -123,8 +138,10 @@ enum Msg {
 }
 
 fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
+    model.conn_status = ConnStatus::Connected;
     match msg {
         ReplyMessage::Stats(x) => {
+            model.allow_sending_status_inquiries = true;
             model.status = Some(x);
         }
         ReplyMessage::Error(x) => {
@@ -140,6 +157,7 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
                 new_tickers_this_session: 0,
                 server_version: "".to_owned(),
                 upstream_status,
+                rest: serde_json::Value::Null,
             });
         }
         ReplyMessage::Config(x) => {
@@ -162,19 +180,31 @@ fn send_ws(cmsg: ControlMessage, model: &mut Model, _orders: &mut impl Orders<Ms
     }
 }
 
+fn closews(model: &mut Model, _orders:  &mut impl Orders<Msg>) {
+    if let Some(ws) = model.ws.as_mut() {
+        let _ = ws.close(None, None);
+        model.ws = None;
+    }
+    model.conn_status = ConnStatus::Disconnected;
+}
+
 // `update` describes how to handle each `Msg`.
 fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
     match msg {
         Msg::SecondlyUpdate => {
             if let Some(ws) = model.ws.as_ref() {
-                let _ = ws.send_json(&ControlMessage::Status);
+                if model.allow_sending_status_inquiries {
+                    let _ = ws.send_json(&ControlMessage::Status);
+                    model.allow_sending_status_inquiries = false;
+                } else {
+                    model.conn_status = ConnStatus::Lagging;
+                }
             }
         }
         Msg::UpdateWsUrl(x) => model.wsurl = x,
         Msg::ToggleConnectWs => {
-            if let Some(ws) = model.ws.as_mut() {
-                let _ = ws.close(None, None);
-                model.ws = None;
+            if model.ws.is_some() {
+                closews(model, orders);
             } else {
                 let ws = seed::browser::web_socket::WebSocket::builder(&model.wsurl, orders)
                 .on_open(||Msg::WsConnected)
@@ -199,11 +229,11 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
         }
         Msg::WsClosed => {
             model.errormsg = "WebSocket closed".to_owned();
-            model.ws = None;
+            closews(model, orders);
         }
         Msg::WsError =>  {
             model.errormsg = "WebSocket error".to_owned();
-            model.ws = None;
+            closews(model, orders);
         }
         Msg::WsConnected =>  {
             model.errormsg.clear();
@@ -249,6 +279,20 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
         Msg::ToggleVisiblePassword => model.visible_password ^= true,
         Msg::UpdateConfig(x) => model.config = x,
     }
+    html_document().set_title(match model.conn_status {
+        ConnStatus::Disconnected => "WsPrx: diconnected",
+        ConnStatus::Lagging => "WsPrx: lagging",
+        ConnStatus::Connected => match &model.status {
+            Some(us) => match us.upstream_status {
+                UpstreamStatus::Connected => "WsPrx",
+                UpstreamStatus::Disabled => "WsPrx: off",
+                UpstreamStatus::Paused => "WsPrx: paused",
+                UpstreamStatus::Connecting => "WsPrx: connecing",
+                UpstreamStatus::Mirroring => "WsPrx: mirroring",
+            }
+            None => "WsPrx: ?",
+        }
+    });
 }
 
 // ------ ------
@@ -261,6 +305,45 @@ fn view(model: &Model) -> Node<Msg> {
         div![
             C!["title"],
             "AlpacaProxy control panel"
+        ],
+        div![
+            C!["mainstatus"],
+            div![
+                C!["connstatus"],
+                C![format!("connstatus_{:?}", model.conn_status)],
+            ],
+            div![
+                C!["serverstatus"],
+                if let Some(ss) = &model.status {
+                    match ss.upstream_status {
+                        UpstreamStatus::Connected => {
+                            if let Some(ltu) = ss.last_ticker_update_ms {
+                                if ltu > 120 {
+                                    C!["serverstatus_ConnectedNoRecv"]
+                                } else {
+                                    C!["serverstatus_Connected"]
+                                }
+                            } else {
+                                C!["serverstatus_ConnectedNoTU"]
+                            }
+                        },
+                        UpstreamStatus::Mirroring => {
+                            if let Some(ltu) = ss.last_ticker_update_ms {
+                                if ltu > 120 {
+                                    C!["serverstatus_MirroringNoRecv"]
+                                } else {
+                                    C!["serverstatus_Mirroring"]
+                                }
+                            } else {
+                                C!["serverstatus_MirroringNoTU"]
+                            }
+                        }
+                        x => C![format!("serverstatus_{:?}", x )],
+                    }
+                } else {
+                    C!["serverstatus_None"]
+                },
+            ],
         ],
         div![
             C!["websocketcontrol"],
