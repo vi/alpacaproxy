@@ -3,19 +3,25 @@
 // but some rules are too "annoying" or are not applicable for your case.)
 #![allow(clippy::wildcard_imports)]
 
-use seed::{prelude::*, *};
+use seed::{*, prelude::*};
 
 // ------ ------
 //     Init
 // ------ ------
 
 // `init` describes what should happen when your app started.
-fn init(_: Url, _orders: &mut impl Orders<Msg>) -> Model {
+fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
+    orders.stream(seed::app::streams::interval(1000, ||Msg::SecondlyUpdate));
     Model { 
-        counter: 0,
         wsurl: "ws://127.0.0.1:1234".to_owned(),
         ws: None,
         errormsg: "".to_owned(),
+        status: None,
+        password: "".to_owned(),
+        visible_password: false,
+        allow_shutdown: false,
+        show_config_editor: false,
+        config: "".to_owned(),
     }
 }
 
@@ -25,10 +31,67 @@ fn init(_: Url, _orders: &mut impl Orders<Msg>) -> Model {
 
 // `Model` describes our app state.
 struct Model {
-    counter: i32,
     wsurl: String,
     ws: Option<WebSocket>,
     errormsg: String,
+    status: Option<SystemStatus>,
+    password: String,
+    allow_shutdown: bool,
+    show_config_editor: bool,
+    visible_password: bool,
+    config: String,
+}
+
+#[derive(serde_derive::Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStatus {
+    Disabled,
+    Paused,
+    Connecting,
+    Connected,
+    Mirroring,
+}
+
+#[derive(serde_derive::Deserialize, Debug)]
+pub struct SystemStatus {
+    database_size: u64,
+    first_datum_id: Option<u64>,
+    last_datum_id: Option<u64>,
+    clients_connected: usize,
+    last_ticker_update_ms: Option<u64>,
+    upstream_status: UpstreamStatus,
+    new_tickers_this_session: usize,
+    server_version: String,
+}
+
+#[derive(serde_derive::Serialize)]
+#[serde(tag = "stream", content = "data")]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum ControlMessage {
+    Preroll(u64),
+    Monitor,
+    Filter(Vec<String>),
+    RemoveRetainingLastN(u64),
+    DatabaseSize,
+    Status,
+    Shutdown,
+    PauseUpstream,
+    ResumeUpstream,
+    CursorToSpecificId(u64),
+    Password(String),
+    WriteConfig(serde_json::Value),
+    ReadConfig,
+}
+
+#[derive(serde_derive::Deserialize,)]
+#[serde(tag = "stream", content = "data")]
+#[serde(rename_all = "snake_case")]
+enum ReplyMessage {
+    Stats(SystemStatus),
+    Error(String),
+    Hello(UpstreamStatus),
+    Config(serde_json::Value),
 }
 
 // ------ ------
@@ -39,22 +102,73 @@ struct Model {
 #[derive()]
 // `Msg` describes the different events you can modify state with.
 enum Msg {
-    Increment,
-    StartCounter,
+    SecondlyUpdate,
     UpdateWsUrl(String),
+    UpdatePassword(String),
+    UpdateConfig(String),
     ToggleConnectWs,
     WsClosed,
     WsError,
     WsConnected,
     WsMessage(WebSocketMessage),
+    PauseUpstream,
+    ResumeUpstream,
+    SendPassword,
+    ToggleAllowServerShutdown,
+    SendServerShutdown,
+    ToggleConfigEditorDisplay,
+    ReadConfig,
+    WriteConfig,
+    ToggleVisiblePassword,
+}
+
+fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
+    match msg {
+        ReplyMessage::Stats(x) => {
+            model.status = Some(x);
+        }
+        ReplyMessage::Error(x) => {
+            model.errormsg = format!("Error from server: {}", x);
+        }
+        ReplyMessage::Hello(upstream_status) => {
+            model.status = Some(SystemStatus{
+                database_size: 0,
+                clients_connected: 0,
+                first_datum_id: None,
+                last_datum_id: None,
+                last_ticker_update_ms: None,
+                new_tickers_this_session: 0,
+                server_version: "".to_owned(),
+                upstream_status,
+            });
+        }
+        ReplyMessage::Config(x) => {
+            if let Ok(y) = serde_json::to_string_pretty(&x) {
+                model.config = y;
+            } else {
+                model.errormsg = "Strange thing instead of config".to_owned();
+            }
+        }
+    }
+}   
+
+fn send_ws(cmsg: ControlMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
+    if let Some(ws) = model.ws.as_ref() {
+        if let Err(e) = ws.send_json(&cmsg) {
+            model.errormsg = format!("WebSocket error: {:?}", e);
+        }
+    } else {
+        model.errormsg = "Error: WebSocket must be connected for this".to_owned();
+    }
 }
 
 // `update` describes how to handle each `Msg`.
 fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
     match msg {
-        Msg::Increment => model.counter += 1,
-        Msg::StartCounter => {
-            orders.stream(seed::app::streams::interval(1000, ||Msg::Increment));
+        Msg::SecondlyUpdate => {
+            if let Some(ws) = model.ws.as_ref() {
+                let _ = ws.send_json(&ControlMessage::Status);
+            }
         }
         Msg::UpdateWsUrl(x) => model.wsurl = x,
         Msg::ToggleConnectWs => {
@@ -70,9 +184,13 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
                 .build_and_open();
                 match ws {
                     Ok(x) => {
+                        // for in-browser debugging using web console:
+                        let _ = js_sys::Reflect::set(&window(), &JsValue::from_str("ws"), x.raw_web_socket());
+
                         model.ws = Some(x);
                     }
                     Err(e) => {
+                        model.errormsg = format!("{:?}", e);
                         log(e);
                     }
                 }
@@ -92,10 +210,44 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
         }
         Msg::WsMessage(x) =>  {
             if let Ok(t) = x.json() {
-                let t: serde_json::Value = t;
-                let _ = model.ws.as_mut().unwrap().send_json(&t);
+                handle_ws_message(t, model, orders);
+            } else {
+                log!("Invalid WebSocket message: {}", x.text());
             }
         }
+        Msg::UpdatePassword(x) => model.password = x,
+        Msg::SendPassword => send_ws(ControlMessage::Password(model.password.clone()), model, orders),
+        Msg::ToggleAllowServerShutdown => {
+            model.allow_shutdown = !model.allow_shutdown;
+        }
+        Msg::PauseUpstream => send_ws(ControlMessage::PauseUpstream,model,orders),
+        Msg::ResumeUpstream => send_ws(ControlMessage::ResumeUpstream,model,orders),
+        Msg::SendServerShutdown => {
+            if model.allow_shutdown {
+                send_ws(ControlMessage::Shutdown, model, orders);
+            } else {
+                model.errormsg = "Check the checkbox to enable this function".to_owned();
+            }
+        }
+        Msg::ToggleConfigEditorDisplay => {
+            model.show_config_editor = !model.show_config_editor;
+        }
+        Msg::ReadConfig => {
+            send_ws(ControlMessage::ReadConfig, model, orders);
+        }
+        Msg::WriteConfig => {
+            match serde_json::from_str(&model.config) {
+                Err(e) => {
+                    model.errormsg = format!("Input is not valid JSON: {}", e);
+                }
+                Ok(x) => {
+                    let x : serde_json::Value = x;
+                    send_ws(ControlMessage::WriteConfig(x), model, orders);
+                }
+            }
+        }
+        Msg::ToggleVisiblePassword => model.visible_password ^= true,
+        Msg::UpdateConfig(x) => model.config = x,
     }
 }
 
@@ -107,13 +259,8 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
 fn view(model: &Model) -> Node<Msg> {
     div![
         div![
-            "This is a counter: ",
-            C!["counter"],
-            button![model.counter, ev(Ev::Click, |_| Msg::StartCounter),],
-        ],
-        div![
-            C!["errormsg"],
-            &model.errormsg,
+            C!["title"],
+            "AlpacaProxy control panel"
         ],
         div![
             "WebSocket URL:",
@@ -125,6 +272,82 @@ fn view(model: &Model) -> Node<Msg> {
             button![
                 if model.ws.is_none() { "Connect" } else { "Disconnect"} ,
                 ev(Ev::Click, |_|Msg::ToggleConnectWs),
+            ],
+        ],
+        div![
+            "Password:",
+            input![
+                C!["password"],
+                attrs! { At::Type => if model.visible_password { "text" } else { "password" } },
+                input_ev(Ev::Input, Msg::UpdatePassword),
+            ],
+            label![
+                "Visible password",
+                input![
+                    C!["visiblepwd"],
+                    attrs!{At::Type => "checkbox", At::Checked => model.visible_password.as_at_value()},
+                    ev(Ev::Change, |_| Msg::ToggleVisiblePassword),
+                ],
+            ],
+            button![
+                "Send",
+                ev(Ev::Click, |_|Msg::SendPassword),
+            ],
+        ],
+        div![
+            label![
+                "Allow server shutdown",
+                input![
+                    C!["allowshutdown"],
+                    attrs!{At::Type => "checkbox", At::Checked => model.allow_shutdown.as_at_value()},
+                    ev(Ev::Change, |_| Msg::ToggleAllowServerShutdown),
+                ],
+            ],
+            button![ "Pause upstream", C!["pause"], ev(Ev::Click, |_|Msg::PauseUpstream)],
+            button![ "Resume upstream", C!["resume"], ev(Ev::Click, |_|Msg::ResumeUpstream)],
+            button![ "Server shutdown", C!["shutdown"], ev(Ev::Click, |_|Msg::SendServerShutdown)],
+        ],
+        div![
+            div![
+                label![
+                    "Show config editor",
+                    input![
+                        C!["showconfig"],
+                        attrs!{At::Type => "checkbox", At::Checked => model.show_config_editor.as_at_value()},
+                        ev(Ev::Change, |_| Msg::ToggleConfigEditorDisplay),
+                    ],
+                ],
+            ],
+            if model.show_config_editor {
+                div![
+                    div![
+                        button![ "Read config", C!["readconfig"], ev(Ev::Click, |_|Msg::ReadConfig)],
+                        button![ "Write config", C!["writeconfig"], ev(Ev::Click, |_|Msg::WriteConfig)],
+                    ],
+                    div![
+                        textarea![
+                            C!["config"],
+                            attrs!{ At::Value => model.config },
+                            input_ev(Ev::Input, Msg::UpdateConfig),
+                        ]
+                    ],
+                ]
+            } else {
+                div![]
+            }
+        ],
+        div![
+            C!["errormsg"],
+            &model.errormsg,
+        ],
+        div![
+            C!["systemstatus"],
+            pre![
+                if let Some(ss) = &model.status {
+                    format!("{:#?}", ss)
+                } else {
+                    "Not connected".to_owned()
+                }
             ],
         ],
     ]
