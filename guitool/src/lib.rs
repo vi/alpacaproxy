@@ -24,7 +24,7 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
                 durl = format!("ws{}",&durl[4..]);
             }
             if durl.ends_with(".html") {
-                durl = format!("{}/ws", &durl[(durl.len()-5)..]);
+                durl = format!("{}/ws", &durl[..(durl.len()-5)]);
                 wsurl = durl;
             }
         }
