@@ -70,6 +70,10 @@ label span {
     height: 30px;
     margin-left: 20px;
 }
+.configeditor div.configbuttons:after {
+    margin-left: 10px;
+    content: "(pause and restart to apply)";
+}
 .configtext {
     display: block;
     min-width: 680px;

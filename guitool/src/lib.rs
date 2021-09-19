@@ -395,9 +395,9 @@ fn view(model: &Model) -> Node<Msg> {
                     ev(Ev::Change, |_| Msg::ToggleAllowServerShutdown),
                 ],
             ],
-            button![ "Pause upstream", C!["pause"], ev(Ev::Click, |_|Msg::PauseUpstream)],
-            button![ "Resume upstream", C!["resume"], ev(Ev::Click, |_|Msg::ResumeUpstream)],
-            button![ "Server shutdown", C!["shutdown"], ev(Ev::Click, |_|Msg::SendServerShutdown)],
+            button![ "⏸️ Pause upstream", C!["pause"], ev(Ev::Click, |_|Msg::PauseUpstream)],
+            button![ "▶️ Resume upstream", C!["resume"], ev(Ev::Click, |_|Msg::ResumeUpstream)],
+            button![ "🛑 Server shutdown", C!["shutdown"], ev(Ev::Click, |_|Msg::SendServerShutdown)],
         ],
         div![
             C!["configeditor"],
