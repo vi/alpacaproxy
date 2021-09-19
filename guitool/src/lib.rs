@@ -11,9 +11,28 @@ use seed::{*, prelude::{*}};
 
 // `init` describes what should happen when your app started.
 fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
+    
+    let mut wsurl = "ws://127.0.0.1:1234".to_owned();
+    if let Ok(mut durl) =  html_document().url() {
+        let splits : Vec<&str> = durl.split('#').collect();
+        if splits.len() >= 2 {
+            wsurl = splits[1].to_owned();
+            // assuming it would be rendered by that time:
+            orders.perform_cmd(cmds::timeout(20, || Msg::AutoConnectAndFocusPassword));
+        } else {
+            if durl.starts_with("http") {
+                durl = format!("ws{}",&durl[4..]);
+            }
+            if durl.ends_with(".html") {
+                durl = format!("{}/ws", &durl[(durl.len()-5)..]);
+                wsurl = durl;
+            }
+        }
+    };
+
     orders.stream(seed::app::streams::interval(1000, ||Msg::SecondlyUpdate));
     Model { 
-        wsurl: "ws://127.0.0.1:1234".to_owned(),
+        wsurl,
         ws: None,
         errormsg: "".to_owned(),
         status: None,
@@ -135,6 +154,7 @@ enum Msg {
     ReadConfig,
     WriteConfig,
     ToggleVisiblePassword,
+    AutoConnectAndFocusPassword,
 }
 
 fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
@@ -278,6 +298,19 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
         }
         Msg::ToggleVisiblePassword => model.visible_password ^= true,
         Msg::UpdateConfig(x) => model.config = x,
+        Msg::AutoConnectAndFocusPassword => {
+            //log("1");
+            if let Some(pe) = html_document().get_element_by_id("passwordentry") {
+                //log("2");
+                if let Ok(fm) = js_sys::Reflect::get(pe.as_ref(), &JsValue::from_str("focus")) {
+                    //log("3");
+                    if let Some(fm) = wasm_bindgen::JsCast::dyn_ref(&fm) {
+                        let _ = js_sys::Function::call0(fm, pe.as_ref());
+                    }
+                }
+            }
+            return update(Msg::ToggleConnectWs, model, orders);
+        }
     }
     html_document().set_title(match model.conn_status {
         ConnStatus::Disconnected => "WsPrx: diconnected",
@@ -367,6 +400,7 @@ fn view(model: &Model) -> Node<Msg> {
                 span!["Password:"],
                 input![
                     C!["password"],
+                    id!["passwordentry"],
                     attrs! { At::Type => if model.visible_password { "text" } else { "password" } },
                     input_ev(Ev::Input, Msg::UpdatePassword),
                     keyboard_ev(Ev::KeyUp, |e| { if e.key() == "Enter" { Some(Msg::SendPassword) } else { None } }),
