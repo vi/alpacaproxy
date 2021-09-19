@@ -30,13 +30,19 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
         }
     };
 
+    let mut password = "".to_owned();
+
+    if let Ok(x) = LocalStorage::get("password") {
+        password = x;
+    }
+
     orders.stream(seed::app::streams::interval(1000, ||Msg::SecondlyUpdate));
     Model { 
         wsurl,
         ws: None,
         errormsg: "".to_owned(),
         status: None,
-        password: "".to_owned(),
+        password,
         visible_password: false,
         allow_shutdown: false,
         show_config_editor: false,
@@ -69,6 +75,7 @@ struct Model {
 #[derive(Debug)]
 enum ConnStatus {
     Disconnected,
+    Unauthenticated,
     Connected,
     Lagging,
 }
@@ -98,7 +105,7 @@ pub struct SystemStatus {
     rest: serde_json::Value,
 }
 
-#[derive(serde_derive::Serialize)]
+#[derive(serde_derive::Serialize, Debug)]
 #[serde(tag = "stream", content = "data")]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
@@ -118,7 +125,7 @@ enum ControlMessage {
     ReadConfig,
 }
 
-#[derive(serde_derive::Deserialize,)]
+#[derive(serde_derive::Deserialize, Debug)]
 #[serde(tag = "stream", content = "data")]
 #[serde(rename_all = "snake_case")]
 enum ReplyMessage {
@@ -158,6 +165,9 @@ enum Msg {
 }
 
 fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
+    if ! matches! (msg, ReplyMessage::Stats(..)) {
+        log(&msg);
+    }
     model.conn_status = ConnStatus::Connected;
     match msg {
         ReplyMessage::Stats(x) => {
@@ -165,7 +175,12 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
             model.status = Some(x);
         }
         ReplyMessage::Error(x) => {
-            model.errormsg = format!("Error from server: {}", x);
+            model.allow_sending_status_inquiries = true;
+            if x.contains("Supply a password first") || x.contains("Invalid password") {
+                model.conn_status = ConnStatus::Unauthenticated;
+            } else {
+                model.errormsg = format!("Error from server: {}", x);
+            }
         }
         ReplyMessage::Hello(upstream_status) => {
             model.status = Some(SystemStatus{
@@ -179,6 +194,10 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
                 upstream_status,
                 rest: serde_json::Value::Null,
             });
+            if ! model.password.is_empty() {
+                let _ = model.ws.as_ref().unwrap().send_json(&ControlMessage::Password(model.password.clone()));
+            }
+            let _ = model.ws.as_ref().unwrap().send_json(&ControlMessage::Status);
         }
         ReplyMessage::Config(x) => {
             if let Ok(y) = serde_json::to_string_pretty(&x) {
@@ -192,6 +211,7 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
 
 fn send_ws(cmsg: ControlMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
     if let Some(ws) = model.ws.as_ref() {
+        log(&cmsg);
         if let Err(e) = ws.send_json(&cmsg) {
             model.errormsg = format!("WebSocket error: {:?}", e);
         }
@@ -266,7 +286,10 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
             }
         }
         Msg::UpdatePassword(x) => model.password = x,
-        Msg::SendPassword => send_ws(ControlMessage::Password(model.password.clone()), model, orders),
+        Msg::SendPassword => {
+            let _ = LocalStorage::insert("password", &model.password);
+            send_ws(ControlMessage::Password(model.password.clone()), model, orders)
+        },
         Msg::ToggleAllowServerShutdown => {
             model.allow_shutdown = !model.allow_shutdown;
         }
@@ -315,6 +338,7 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
     html_document().set_title(match model.conn_status {
         ConnStatus::Disconnected => "WsPrx: diconnected",
         ConnStatus::Lagging => "WsPrx: lagging",
+        ConnStatus::Unauthenticated => "WsPrx: passwd",
         ConnStatus::Connected => match &model.status {
             Some(us) => match us.upstream_status {
                 UpstreamStatus::Connected => "WsPrx",
@@ -401,7 +425,10 @@ fn view(model: &Model) -> Node<Msg> {
                 input![
                     C!["password"],
                     id!["passwordentry"],
-                    attrs! { At::Type => if model.visible_password { "text" } else { "password" } },
+                    attrs! {
+                        At::Type => if model.visible_password { "text" } else { "password" },
+                        At::Value => model.password,
+                    },
                     input_ev(Ev::Input, Msg::UpdatePassword),
                     keyboard_ev(Ev::KeyUp, |e| { if e.key() == "Enter" { Some(Msg::SendPassword) } else { None } }),
                 ],

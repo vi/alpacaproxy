@@ -111,6 +111,9 @@ label span {
 .connstatus_Lagging { background: #ff8; }
 .connstatus_Connected:after { content: "Connected"; }
 .connstatus_Connected { background: #8f8; }
+.connstatus_Unauthenticated:after { content: "Passswd?"; }
+.connstatus_Unauthenticated { background: #f8f; }
+
 
 .serverstatus:before {
     content: "Server upstream:";
