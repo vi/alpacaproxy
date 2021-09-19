@@ -1,0 +1,77 @@
+.title {
+    font-size: 20pt;
+    padding-left: 30px;
+}
+
+.websocketcontrol {
+    background: lightgray;
+}
+
+.websocketcontrol input {
+    width: 400px;
+    height: 20px;
+}
+.websocketcontrol button {
+    margin-left: 20px;
+    width: 100px;
+    height: 30px;
+}
+
+#app div div {
+    margin-top: 10px;
+    max-width: 700px;
+}
+label span {
+    display: inline-block;
+    width: 150px;
+}
+
+.passwordcontrol {
+   background: lightcyan;
+}
+.passwordcontrol .password {
+    width: 250px;
+    height: 20px;
+}
+.passwordcontrol .visiblepwd {
+    display: inline-block;
+    width: 150px;
+}
+.passwordcontrol button {
+    margin-left: 20px;
+    width: 100px;
+    height: 30px;
+}
+
+.mainactions {
+    background: lightyellow;
+    display: flex;
+    align-items: center;
+}
+.mainactions * {
+    flex-grow: 1;
+}
+.mainactions button {
+    height: 40px;
+}
+.configeditor {
+    background: #efe;
+}
+.configeditor .showconfig, .configeditor .configbuttons {
+    display: inline-block;
+    margin-bottom: 12px;
+}
+.configeditor .showconfig {
+    margin-left: 26px;
+    margin-top: 14px;
+}
+.configeditor button {
+    width: 100px;
+    height: 30px;
+    margin-left: 20px;
+}
+.configtext {
+    display: block;
+    min-width: 680px;
+    min-height: 200px;
+}

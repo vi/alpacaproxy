@@ -3,7 +3,7 @@
 // but some rules are too "annoying" or are not applicable for your case.)
 #![allow(clippy::wildcard_imports)]
 
-use seed::{*, prelude::*};
+use seed::{*, prelude::{*}};
 
 // ------ ------
 //     Init
@@ -263,11 +263,15 @@ fn view(model: &Model) -> Node<Msg> {
             "AlpacaProxy control panel"
         ],
         div![
-            "WebSocket URL:",
-            input![
-                C!["websocket-uri"],
-                attrs!{ At::Value => model.wsurl },
-                input_ev(Ev::Input, Msg::UpdateWsUrl),
+            C!["websocketcontrol"],
+            label![
+                span!["WebSocket URL:"],
+                input![
+                    C!["websocket-uri"],
+                    attrs!{ At::Value => model.wsurl, At::Type => "text" },
+                    input_ev(Ev::Input, Msg::UpdateWsUrl),
+                    keyboard_ev(Ev::KeyUp, |e| { if e.key() == "Enter" { Some(Msg::ToggleConnectWs) } else { None } }),
+                ],
             ],
             button![
                 if model.ws.is_none() { "Connect" } else { "Disconnect"} ,
@@ -275,16 +279,20 @@ fn view(model: &Model) -> Node<Msg> {
             ],
         ],
         div![
-            "Password:",
-            input![
-                C!["password"],
-                attrs! { At::Type => if model.visible_password { "text" } else { "password" } },
-                input_ev(Ev::Input, Msg::UpdatePassword),
+            C!["passwordcontrol"],
+            label![
+                span!["Password:"],
+                input![
+                    C!["password"],
+                    attrs! { At::Type => if model.visible_password { "text" } else { "password" } },
+                    input_ev(Ev::Input, Msg::UpdatePassword),
+                    keyboard_ev(Ev::KeyUp, |e| { if e.key() == "Enter" { Some(Msg::SendPassword) } else { None } }),
+                ],
             ],
             label![
+                C!["visiblepwd"],
                 "Visible password",
                 input![
-                    C!["visiblepwd"],
                     attrs!{At::Type => "checkbox", At::Checked => model.visible_password.as_at_value()},
                     ev(Ev::Change, |_| Msg::ToggleVisiblePassword),
                 ],
@@ -295,6 +303,7 @@ fn view(model: &Model) -> Node<Msg> {
             ],
         ],
         div![
+            C!["mainactions"],
             label![
                 "Allow server shutdown",
                 input![
@@ -308,33 +317,35 @@ fn view(model: &Model) -> Node<Msg> {
             button![ "Server shutdown", C!["shutdown"], ev(Ev::Click, |_|Msg::SendServerShutdown)],
         ],
         div![
+            C!["configeditor"],
             div![
                 label![
+                    C!["showconfig"],
                     "Show config editor",
                     input![
-                        C!["showconfig"],
                         attrs!{At::Type => "checkbox", At::Checked => model.show_config_editor.as_at_value()},
                         ev(Ev::Change, |_| Msg::ToggleConfigEditorDisplay),
                     ],
                 ],
-            ],
-            if model.show_config_editor {
-                div![
+                if model.show_config_editor {
                     div![
+                        C!["configbuttons"],
                         button![ "Read config", C!["readconfig"], ev(Ev::Click, |_|Msg::ReadConfig)],
                         button![ "Write config", C!["writeconfig"], ev(Ev::Click, |_|Msg::WriteConfig)],
-                    ],
-                    div![
-                        textarea![
-                            C!["config"],
-                            attrs!{ At::Value => model.config },
-                            input_ev(Ev::Input, Msg::UpdateConfig),
-                        ]
-                    ],
+                    ]
+                } else {
+                    div![]
+                },
+            ],
+            if model.show_config_editor {
+                textarea![
+                    C!["configtext"],
+                    attrs!{ At::Value => model.config },
+                    input_ev(Ev::Input, Msg::UpdateConfig),
                 ]
             } else {
                 div![]
-            }
+            },
         ],
         div![
             C!["errormsg"],
