@@ -666,6 +666,7 @@ impl UpstreamStats {
                     log::debug!("Received 'preroll_finished' response");
                     if automirror {
                         self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                        log::info!("Finished updating the mirror");
                     }
                 }
                 "hello" => {

@@ -383,7 +383,7 @@ fn view(model: &Model) -> Node<Msg> {
                     match ss.upstream_status {
                         UpstreamStatus::Connected => {
                             if let Some(ltu) = ss.last_ticker_update_ms {
-                                if ltu > 120 {
+                                if ltu > 120000 {
                                     C!["serverstatus_ConnectedNoRecv"]
                                 } else {
                                     C!["serverstatus_Connected"]
@@ -394,7 +394,7 @@ fn view(model: &Model) -> Node<Msg> {
                         },
                         UpstreamStatus::Mirroring => {
                             if let Some(ltu) = ss.last_ticker_update_ms {
-                                if ltu > 120 {
+                                if ltu > 120000 {
                                     C!["serverstatus_MirroringNoRecv"]
                                 } else {
                                     C!["serverstatus_Mirroring"]
