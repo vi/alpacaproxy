@@ -53,7 +53,7 @@ pub struct UpstreamStats(std::sync::Mutex<UpstreamStatsBuffer>);
 
 pub async fn main_actor(
     config_filename: PathBuf,
-    db: &sled::Db,
+    db: &crate::database::Db,
     mut rx: UnboundedReceiver<ConsoleControl>,
     size_cap: Option<u64>,
     watcher_tx: WatchSender<u64>,
@@ -92,10 +92,10 @@ pub async fn main_actor(
             ConsoleControl::ClientConnected => num_clients += 1,
             ConsoleControl::ClientDisconnected => num_clients -= 1,
             ConsoleControl::Status(tx) => {
-                let (first_datum_id, last_datum_id) = crate::database::get_first_last_id(db)?;
+                let (first_datum_id, last_datum_id) = db.get_first_last_id()?;
                 let stats = upstream_stats.0.lock().unwrap();
                 let ss = SystemStatus {
-                    database_size: db.size_on_disk()?,
+                    database_size: db.get_database_disk_size()?,
                     clients_connected: num_clients,
                     last_ticker_update_ms: stats
                         .last_update
@@ -150,7 +150,7 @@ impl UpstreamStats {
     async fn connect_upstream(
         self: Arc<Self>,
         config_filename: PathBuf,
-        db: sled::Db,
+        db: crate::database::Db,
         size_cap: Option<u64>,
         watcher_tx: UnboundedSender<u64>,
     ) -> () {

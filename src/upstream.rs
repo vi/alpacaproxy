@@ -20,7 +20,7 @@ impl crate::mainactor::UpstreamStats {
         uri: &url::Url,
         startup_messages: &[serde_json::Value],
         automirror: bool,
-        db: &sled::Db,
+        db: &crate::database::Db,
         size_cap: Option<u64>,
         watcher_tx: UnboundedSender<u64>,
     ) -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ impl crate::mainactor::UpstreamStats {
         }
         if automirror {
             self.0.lock().unwrap().status = UpstreamStatus::Mirroring;
-            let cursor = match crate::database::get_first_last_id(db)? {
+            let cursor = match db.get_first_last_id()? {
                 (_, Some(x)) => x + 1,
                 _ => 0,
             };
@@ -63,7 +63,7 @@ impl crate::mainactor::UpstreamStats {
         }
         log::debug!("Establishing upstream connection 3");
 
-        let mut nextkey = crate::database::get_next_db_key(&db)?;
+        let mut nextkey = db.get_next_db_key()?;
         let mut slowdown_mode = false;
 
         let mut handle_msg = |msg: crate::Message| -> anyhow::Result<(bool, bool)> {
@@ -105,7 +105,7 @@ impl crate::mainactor::UpstreamStats {
                     }
                     if let Some(size_cap) = size_cap {
                         if do_consider_db_size {
-                            let dbsz = db.size_on_disk()?;
+                            let dbsz = db.get_database_disk_size()?;
                             if dbsz > size_cap * 2 {
                                 log::warn!(
                                     "Slowing down reading from upstream due to database overflow"
@@ -123,7 +123,8 @@ impl crate::mainactor::UpstreamStats {
                         nextkey = newid;
                     }
 
-                    db.insert(nextkey.to_be_bytes(), serde_json::to_vec(&msg.data)?)?;
+                    let val : crate::database::MinutelyData = serde_json::from_value(msg.data)?;
+                    db.insert_entry(nextkey, &val)?;
                     let _ = watcher_tx.send(nextkey);
                     nextkey = nextkey.checked_add(1).context("Key space is full")?;
                     return Ok((do_yield, slowdown_mode));

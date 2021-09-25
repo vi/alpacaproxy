@@ -22,6 +22,9 @@ tokio = {version="1.11.0", features=["macros","rt","time","sync", "net", "io-uti
 tokio-tungstenite = {version="0.15.0", features=["rustls-tls"]}
 url = { version = "2.2.2", features = ["serde"] }
 
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 opt-level = "s"
 debug = true

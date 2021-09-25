@@ -33,7 +33,7 @@ pub enum ControlMessage {
 
 struct ServeClient {
     ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    db: sled::Db,
+    db: crate::database::Db,
     cursor: Option<u64>,
     filter: Option<hashbrown::HashSet<smol_str::SmolStr>>,
     console_control: UnboundedSender<ConsoleControl>,
@@ -44,7 +44,7 @@ struct ServeClient {
 
 async fn serve_client(
     client_socket: tokio::net::TcpStream,
-    db: &sled::Db,
+    db: &crate::database::Db,
     console_control: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
     db_watcher: WatchReceiver<u64>,
@@ -90,7 +90,7 @@ impl ServeClient {
             );
             tokio::time::sleep(Duration::from_millis(2000)).await;
         }
-        self.cursor = Some(crate::database::get_next_db_key(&self.db)?);
+        self.cursor = Some(self.db.get_next_db_key()?);
         Ok(self.cursor.unwrap())
     }
 
@@ -168,17 +168,7 @@ impl ServeClient {
         Ok(())
     }
 
-    async fn datum(&mut self, v: sled::IVec, id: u64) -> anyhow::Result<()> {
-        let minutely: MinutelyData = match serde_json::from_slice(&v) {
-            Ok(x) => x,
-            Err(_e) => {
-                log::warn!(
-                    "Failed to properly deserialize minutely datum number {}",
-                    id
-                );
-                return Ok(());
-            }
-        };
+    async fn datum(&mut self, minutely: MinutelyData, id: u64) -> anyhow::Result<()> {
         if let Some(filt) = &self.filter {
             if !filt.contains(&smol_str::SmolStr::new(&minutely.t)) {
                 return Ok(());
@@ -199,7 +189,7 @@ impl ServeClient {
     async fn preroller(&mut self, range: impl Iterator<Item = u64>) -> anyhow::Result<()> {
         for x in range {
             let x: u64 = x;
-            match self.db.get(x.to_be_bytes())? {
+            match self.db.get_entry_by_id(x)? {
                 Some(v) => {
                     self.datum(v, x).await?;
                 }
@@ -218,7 +208,7 @@ impl ServeClient {
             ControlMessage::Preroll(num) => {
                 let cursor = self.get_cursor().await?;
                 let start = cursor.saturating_sub(num);
-                let rangeend = crate::database::get_first_last_id(&self.db)?
+                let rangeend = self.db.get_first_last_id()?
                     .1
                     .unwrap_or(cursor);
                 let range = start..=rangeend;
@@ -258,17 +248,15 @@ impl ServeClient {
             }
             ControlMessage::RemoveRetainingLastN(num) => {
                 log::info!("  retaining {} last samples in the database", num);
-                let first = (0u64).to_be_bytes();
+                let first = self.db.get_first_last_id()?.0.unwrap_or(0);
                 let cursor = self.get_cursor().await?;
-                let last = cursor.saturating_sub(num).to_be_bytes();
+                let last = cursor.saturating_sub(num);
                 let mut ctr = 0u64;
-                for x in self.db.range(first..last) {
-                    if let Ok((key, _val)) = x {
-                        match self.db.remove(&key) {
-                            Err(e) => log::error!("Error removing entry {:?}: {}", key, e),
-                            Ok(None) => (),
-                            Ok(Some(_)) => ctr += 1,
-                        }
+                for key in first..last {
+                    match self.db.remove_entry(key) {
+                        Err(e) => log::error!("Error removing entry {:?}: {}", key, e),
+                        Ok(false) => (),
+                        Ok(true) => ctr += 1,
                     }
                     if ctr % 50 == 0 {
                         tokio::task::yield_now().await;
@@ -288,7 +276,7 @@ impl ServeClient {
             ControlMessage::DatabaseSize => {
                 let buf = serde_json::to_string(&crate::Message {
                     stream: "database_size".to_owned(),
-                    data: serde_json::Value::Number(self.db.size_on_disk()?.into()),
+                    data: serde_json::Value::Number(self.db.get_database_disk_size()?.into()),
                     id: None,
                 })
                 .unwrap();
@@ -362,7 +350,7 @@ impl ServeClient {
 
 pub async fn socket_listener(
     listen_addr: SocketAddr,
-    db: &sled::Db,
+    db: &crate::database::Db,
     console: UnboundedSender<ConsoleControl>,
     require_password: Option<String>,
     watcher_rx: WatchReceiver<u64>,

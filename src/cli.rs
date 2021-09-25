@@ -38,7 +38,7 @@ pub fn main() -> anyhow::Result<()> {
     let first_config = crate::config::read_config(&opts.client_config)?;
     log::debug!("Checked config file");
 
-    let db = sled::Config::default()
+    let sled_db = sled::Config::default()
         .cache_capacity(1024 * 1024)
         .use_compression(true)
         .compression_factor(1)
@@ -47,9 +47,10 @@ pub fn main() -> anyhow::Result<()> {
 
     log::debug!("Opened the database");
 
-    if db.was_recovered() {
+    if sled_db.was_recovered() {
         log::warn!("Database was recovered");
     }
+    let db = crate::database::open_sled(sled_db.clone())?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -59,11 +60,10 @@ pub fn main() -> anyhow::Result<()> {
     let (watcher_tx, watcher_rx) = tokio::sync::watch::channel(0);
 
     if let Some(size_cap) = opts.max_database_size {
-        let db__ = db.clone();
         let database_size_checkup_interval_secs = opts.database_size_checkup_interval_secs;
         rt.spawn(async move {
             if let Err(e) = crate::database::database_capper(
-                db__,
+                sled_db,
                 size_cap,
                 database_size_checkup_interval_secs,
             )
