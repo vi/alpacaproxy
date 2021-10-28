@@ -9,6 +9,8 @@ pub struct MinutelyData {
     #[serde(rename = "T")]
     pub t: String,
 
+    pub e: u64,
+
     #[serde(flatten)]
     pub rest: serde_json::Value,
 }
