@@ -8,6 +8,7 @@ pub mod client;
 pub mod config;
 pub mod database;
 pub mod mainactor;
+pub mod stats;
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 struct Message {

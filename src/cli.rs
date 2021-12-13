@@ -19,6 +19,7 @@ pub struct Opts {
 #[argh(subcommand)]
 pub enum Cmd {
     Serve(Serve),
+    ReportMissing(ReportMissing),
 }
 
 /// Serve data from database, optionally connecting to Alpaca (or another proxy) upstream
@@ -39,6 +40,14 @@ pub struct Serve {
     #[argh(positional)]
     pub listen_addr: SocketAddr,
 } 
+
+/// Check for missing minutes and report
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name="report_missing")]
+pub struct ReportMissing {
+   
+} 
+
 
 fn opendb(path: &std::path::Path) -> anyhow::Result<sled::Db> {
     Ok(sled::Config::default()
@@ -123,6 +132,11 @@ pub fn main() -> anyhow::Result<()> {
             ));
             rt.shutdown_timeout(Duration::from_millis(100));
             ret
+        }
+        Cmd::ReportMissing(_) => {
+            let sled_db = opendb(&opts.database)?;
+            let db = crate::database::open_sled(sled_db.clone())?;
+            crate::stats::printmissing(&db)
         }
     }
 
