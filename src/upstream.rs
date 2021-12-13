@@ -67,13 +67,16 @@ impl crate::mainactor::UpstreamStats {
         let mut slowdown_mode = false;
 
         let mut handle_msg = |msg: crate::Message| -> anyhow::Result<(bool, bool)> {
-            match &msg.stream[..] {
-                "listening" => {
+            match &msg.tag[..] {
+                "success" => {
+                    log::info!("Success response from upstream: {}", msg.rest.as_object().map(|x|x.get("msg").map(|y|y.as_str())).flatten().flatten().unwrap_or("?") );
+                }
+                "error" => {
+                    log::error!("Error response from upstream: {:?}", serde_json::to_string(&msg));
+                }
+                "subscription" => {
                     log::info!("Established upstream connection");
                     self.0.lock().unwrap().status = UpstreamStatus::Connected;
-                }
-                "authorization" => {
-                    log::debug!("Received 'authorization' response");
                 }
                 "preroll_finished" => {
                     log::debug!("Received 'preroll_finished' response");
@@ -88,8 +91,9 @@ impl crate::mainactor::UpstreamStats {
                         self.0.lock().unwrap().status = UpstreamStatus::Connected;
                     }
                 }
-                x if x.starts_with("AM.") => {
-                    log::debug!("Received minutely update for {}", x);
+                "b" => {
+                    let val : crate::database::MinutelyData = serde_json::from_value(msg.rest)?;
+                    log::debug!("Received minutely update for {}", val.ticker);
                     let mut do_yield = false;
                     let mut do_consider_db_size = false;
                     {
@@ -123,7 +127,6 @@ impl crate::mainactor::UpstreamStats {
                         nextkey = newid;
                     }
 
-                    let val : crate::database::MinutelyData = serde_json::from_value(msg.data)?;
                     db.insert_entry(nextkey, &val)?;
                     let _ = watcher_tx.send(nextkey);
                     nextkey = nextkey.checked_add(1).context("Key space is full")?;
@@ -137,24 +140,37 @@ impl crate::mainactor::UpstreamStats {
         };
 
         while let Some(msg) = upstream.next().await {
-            let (do_yield, slowdown_mode) = match msg {
-                Ok(WebsocketMessage::Text(msg)) => handle_msg(serde_json::from_str(&msg)?)?,
-                Ok(WebsocketMessage::Binary(msg)) => handle_msg(serde_json::from_slice(&msg)?)?,
+            let mut do_yield = false;
+            let mut slowdown_mode = false;
+            match msg {
+                Ok(WebsocketMessage::Text(wsmsg)) => {
+                    let msgs : Vec<crate::Message> = serde_json::from_str(&wsmsg)?;
+                    for msg in msgs {
+                        let (do_yield_, slowdown_mode_) =  handle_msg(msg)?;
+                        do_yield|=do_yield_;
+                        slowdown_mode|=slowdown_mode_;
+                    }
+                },
+                Ok(WebsocketMessage::Binary(wsmsg)) => {
+                    let msgs : Vec<crate::Message> = serde_json::from_slice(&wsmsg)?;
+                    for msg in msgs {
+                        let (do_yield_, slowdown_mode_) =  handle_msg(msg)?;
+                        do_yield|=do_yield_;
+                        slowdown_mode|=slowdown_mode_;
+                    }
+                },
                 Ok(WebsocketMessage::Close(c)) => {
                     log::warn!("Close message from upstream: {:?}", c);
                     break;
                 }
                 Ok(WebsocketMessage::Ping(_)) => {
                     log::debug!("WebSocket ping from upstream");
-                    (false, false)
                 }
                 Ok(_) => {
                     log::warn!("other WebSocket message from upstream");
-                    (false, false)
                 }
                 Err(e) => {
                     log::error!("From upstream websocket: {}", e);
-                    (false, false)
                 }
             };
             if do_yield {

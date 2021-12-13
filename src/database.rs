@@ -2,15 +2,14 @@ use std::{convert::TryInto, sync::Arc, time::Duration};
 
 use anyhow::Context;
 
+// {'T': 'b', 'S': 'TXN', 'o': 193.24, 'c': 193.24, 'h': 193.24, 'l': 193.24, 'v': 977, 't': '2021-12-13T21:04:00Z', 'n': 2, 'vw': 193.238219}
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct MinutelyData {
-    pub ev: String,
+    #[serde(rename = "S")]
+    pub ticker: String,
 
-    #[serde(rename = "T")]
-    pub t: String,
-
-    pub s: i64,
-    pub e: i64,
+    #[serde(rename = "t")]
+    pub start_time: String,
 
     #[serde(flatten)]
     pub rest: serde_json::Value,

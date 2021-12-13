@@ -100,20 +100,20 @@ impl ServeClient {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.console_control
                 .send(ConsoleControl::GetUpstreamState(tx))?;
-            upstream_status = rx.await?;
-        }
-
-        {
-            let buf = serde_json::to_string(&crate::Message {
-                stream: "hello".to_owned(),
-                data: serde_json::to_value(upstream_status)?,
-                id: None,
-            })
-            .unwrap();
-            self.ws.send(WebsocketMessage::Text(buf)).await?;
-        }
-
-        while let Some(msg) = self.ws.next().await {
+                upstream_status = rx.await?;
+            }
+    
+            {
+                let buf = serde_json::to_string(&crate::Message {
+                    tag: "hello".to_owned(),
+                    rest: serde_json::to_value(upstream_status)?,
+                    id: None,
+                })
+                .unwrap();
+                self.ws.send(WebsocketMessage::Text(buf)).await?;
+            }
+    
+            while let Some(msg) = self.ws.next().await {
             let cmsg: ControlMessage = match msg {
                 Ok(WebsocketMessage::Text(msg)) => match serde_json::from_str(&msg) {
                     Ok(x) => x,
@@ -155,13 +155,15 @@ impl ServeClient {
 
     async fn err(&mut self, x: String) -> anyhow::Result<()> {
         log::warn!("Sending error to client: {}", x);
+        use serde_json::value::{Map,Value};
+        use serde_json::Number;
+        let mut error = Map::with_capacity(3);
+        error.insert("T".to_owned(), Value::String("error".to_owned()));
+        error.insert("code".to_owned(), Value::Number(Number::from(505)));
+        error.insert("msg".to_owned(), Value::String(x));
         self.ws
             .send(WebsocketMessage::Text(
-                serde_json::to_string(&crate::Message {
-                    stream: "error".to_owned(),
-                    data: serde_json::Value::String(x),
-                    id: None,
-                })
+                serde_json::to_string(&Value::Array(vec![Value::Object(error)]))
                 .unwrap(),
             ))
             .await?;
@@ -170,18 +172,17 @@ impl ServeClient {
 
     async fn datum(&mut self, minutely: MinutelyData, id: u64) -> anyhow::Result<()> {
         if let Some(filt) = &self.filter {
-            if !filt.contains(&smol_str::SmolStr::new(&minutely.t)) {
+            if !filt.contains(&smol_str::SmolStr::new(&minutely.ticker)) {
                 return Ok(());
             }
         }
-        let stream = format!("{}.{}", minutely.ev, minutely.t);
         let msg = crate::Message {
-            stream,
-            data: serde_json::to_value(minutely)?,
+            tag: "b".to_owned(),
+            rest: serde_json::to_value(minutely)?,
             id: if self.include_ids { Some(id) } else { None },
         };
         self.ws
-            .send(WebsocketMessage::Text(serde_json::to_string(&msg)?))
+            .send(WebsocketMessage::Text(serde_json::to_string(&vec![msg])?))
             .await?;
         Ok(())
     }
@@ -220,8 +221,8 @@ impl ServeClient {
                 self.preroller(range).await?;
                 {
                     let buf = serde_json::to_string(&crate::Message {
-                        stream: "preroll_finished".to_owned(),
-                        data: serde_json::Value::Null,
+                        tag: "preroll_finished".to_owned(),
+                        rest: serde_json::Value::Null,
                         id: None,
                     })
                     .unwrap();
@@ -264,8 +265,8 @@ impl ServeClient {
                 }
                 {
                     let buf = serde_json::to_string(&crate::Message {
-                        stream: "remove_finished".to_owned(),
-                        data: serde_json::Value::Number(ctr.into()),
+                        tag: "remove_finished".to_owned(),
+                        rest: serde_json::Value::Number(ctr.into()),
                         id: None,
                     })
                     .unwrap();
@@ -275,8 +276,8 @@ impl ServeClient {
             }
             ControlMessage::DatabaseSize => {
                 let buf = serde_json::to_string(&crate::Message {
-                    stream: "database_size".to_owned(),
-                    data: serde_json::Value::Number(self.db.get_database_disk_size()?.into()),
+                    tag: "database_size".to_owned(),
+                    rest: serde_json::Value::Number(self.db.get_database_disk_size()?.into()),
                     id: None,
                 })
                 .unwrap();
@@ -292,8 +293,8 @@ impl ServeClient {
                 self.ws
                     .send(WebsocketMessage::Text(serde_json::to_string(
                         &crate::Message {
-                            stream: "stats".to_owned(),
-                            data: serde_json::to_value(ss)?,
+                            tag: "stats".to_owned(),
+                            rest: serde_json::to_value(ss)?,
                             id: None,
                         },
                     )?))
@@ -333,8 +334,8 @@ impl ServeClient {
                 self.ws
                     .send(WebsocketMessage::Text(serde_json::to_string(
                         &crate::Message {
-                            stream: "config".to_owned(),
-                            data: serde_json::to_value(cc)?,
+                            tag: "config".to_owned(),
+                            rest: serde_json::to_value(cc)?,
                             id: None,
                         },
                     )?))
