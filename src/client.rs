@@ -12,21 +12,21 @@ use tokio::sync::{
 };
 
 #[derive(serde_derive::Deserialize, serde_derive::Serialize)]
-#[serde(tag = "stream", content = "data")]
+#[serde(tag = "action")]
 #[serde(rename_all = "snake_case")]
 pub enum ControlMessage {
-    Preroll(u64),
+    Preroll{data:u64},
     Monitor,
-    Filter(Vec<String>),
-    RemoveRetainingLastN(u64),
+    Filter{data:Vec<String>},
+    RemoveRetainingLastN{data:u64},
     DatabaseSize,
     Status,
     Shutdown,
     PauseUpstream,
     ResumeUpstream,
-    CursorToSpecificId(u64),
-    Password(String),
-    WriteConfig(crate::config::ClientConfig),
+    CursorToSpecificId{data:u64},
+    Password{data:String},
+    WriteConfig{data:crate::config::ClientConfig},
     ReadConfig,
     PleaseIncludeIds,
 }
@@ -100,20 +100,20 @@ impl ServeClient {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.console_control
                 .send(ConsoleControl::GetUpstreamState(tx))?;
-                upstream_status = rx.await?;
-            }
-    
-            {
-                let buf = serde_json::to_string(&crate::Message {
-                    tag: "hello".to_owned(),
-                    rest: serde_json::to_value(upstream_status)?,
-                    id: None,
-                })
-                .unwrap();
-                self.ws.send(WebsocketMessage::Text(buf)).await?;
-            }
-    
-            while let Some(msg) = self.ws.next().await {
+            upstream_status = rx.await?;
+        }
+
+        {
+            let buf = serde_json::to_string(&vec![crate::Message {
+                tag: "hello".to_owned(),
+                rest: serde_json::json!({"status": serde_json::to_value(upstream_status)?}),
+                id: None,
+            }])
+            .unwrap();
+            self.ws.send(WebsocketMessage::Text(buf)).await?;
+        }
+
+        while let Some(msg) = self.ws.next().await {
             let cmsg: ControlMessage = match msg {
                 Ok(WebsocketMessage::Text(msg)) => match serde_json::from_str(&msg) {
                     Ok(x) => x,
@@ -155,7 +155,7 @@ impl ServeClient {
 
     async fn err(&mut self, x: String) -> anyhow::Result<()> {
         log::warn!("Sending error to client: {}", x);
-        use serde_json::value::{Map,Value};
+        use serde_json::value::{Map, Value};
         use serde_json::Number;
         let mut error = Map::with_capacity(3);
         error.insert("T".to_owned(), Value::String("error".to_owned()));
@@ -163,8 +163,7 @@ impl ServeClient {
         error.insert("msg".to_owned(), Value::String(x));
         self.ws
             .send(WebsocketMessage::Text(
-                serde_json::to_string(&Value::Array(vec![Value::Object(error)]))
-                .unwrap(),
+                serde_json::to_string(&Value::Array(vec![Value::Object(error)])).unwrap(),
             ))
             .await?;
         Ok(())
@@ -201,17 +200,15 @@ impl ServeClient {
     }
 
     async fn handle_msg(&mut self, msg: ControlMessage) -> anyhow::Result<()> {
-        if self.require_password.is_some() && !matches!(msg, ControlMessage::Password(..)) {
+        if self.require_password.is_some() && !matches!(msg, ControlMessage::Password{..}) {
             self.err("Supply a password first".to_owned()).await?;
             return Ok(());
         }
         match msg {
-            ControlMessage::Preroll(num) => {
+            ControlMessage::Preroll{data:num} => {
                 let cursor = self.get_cursor().await?;
                 let start = cursor.saturating_sub(num);
-                let rangeend = self.db.get_first_last_id()?
-                    .1
-                    .unwrap_or(cursor);
+                let rangeend = self.db.get_first_last_id()?.1.unwrap_or(cursor);
                 let range = start..=rangeend;
                 log::info!(
                     "  prerolling {} messages for the client, really {}",
@@ -220,11 +217,11 @@ impl ServeClient {
                 );
                 self.preroller(range).await?;
                 {
-                    let buf = serde_json::to_string(&crate::Message {
+                    let buf = serde_json::to_string(&vec![crate::Message {
                         tag: "preroll_finished".to_owned(),
                         rest: serde_json::Value::Null,
                         id: None,
-                    })
+                    }])
                     .unwrap();
                     self.ws.send(WebsocketMessage::Text(buf)).await?;
                 }
@@ -247,7 +244,7 @@ impl ServeClient {
                     }
                 }
             }
-            ControlMessage::RemoveRetainingLastN(num) => {
+            ControlMessage::RemoveRetainingLastN{data:num} => {
                 log::info!("  retaining {} last samples in the database", num);
                 let first = self.db.get_first_last_id()?.0.unwrap_or(0);
                 let cursor = self.get_cursor().await?;
@@ -264,26 +261,26 @@ impl ServeClient {
                     }
                 }
                 {
-                    let buf = serde_json::to_string(&crate::Message {
+                    let buf = serde_json::to_string(&vec![crate::Message {
                         tag: "remove_finished".to_owned(),
                         rest: serde_json::Value::Number(ctr.into()),
                         id: None,
-                    })
+                    }])
                     .unwrap();
                     self.ws.send(WebsocketMessage::Text(buf)).await?;
                 }
                 log::info!("  finished removing {} entries", ctr);
             }
             ControlMessage::DatabaseSize => {
-                let buf = serde_json::to_string(&crate::Message {
+                let buf = serde_json::to_string(&vec![crate::Message {
                     tag: "database_size".to_owned(),
                     rest: serde_json::Value::Number(self.db.get_database_disk_size()?.into()),
                     id: None,
-                })
+                }])
                 .unwrap();
                 self.ws.send(WebsocketMessage::Text(buf)).await?;
             }
-            ControlMessage::Filter(a) => {
+            ControlMessage::Filter{data:a} => {
                 self.filter = Some(a.into_iter().map(smol_str::SmolStr::new).collect());
             }
             ControlMessage::Status => {
@@ -292,11 +289,11 @@ impl ServeClient {
                 let ss = rx.await?;
                 self.ws
                     .send(WebsocketMessage::Text(serde_json::to_string(
-                        &crate::Message {
+                        &vec![crate::Message {
                             tag: "stats".to_owned(),
                             rest: serde_json::to_value(ss)?,
                             id: None,
-                        },
+                        }],
                     )?))
                     .await?;
             }
@@ -307,11 +304,11 @@ impl ServeClient {
             ControlMessage::ResumeUpstream => {
                 self.console_control.send(ConsoleControl::ResumeUpstream)?
             }
-            ControlMessage::CursorToSpecificId(newid) => {
+            ControlMessage::CursorToSpecificId{data:newid} => {
                 log::info!("  explicit cursor set to {}", newid);
                 self.cursor = Some(newid);
             }
-            ControlMessage::Password(supplied_password) => {
+            ControlMessage::Password{data:supplied_password} => {
                 if let Some(required_password) = self.require_password.take() {
                     if required_password != supplied_password {
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -324,7 +321,7 @@ impl ServeClient {
                     self.err("No password required".to_owned()).await?;
                 }
             }
-            ControlMessage::WriteConfig(new_config) => self
+            ControlMessage::WriteConfig{data:new_config} => self
                 .console_control
                 .send(ConsoleControl::WriteConfig(new_config))?,
             ControlMessage::ReadConfig => {
@@ -333,11 +330,11 @@ impl ServeClient {
                 let cc = rx.await?;
                 self.ws
                     .send(WebsocketMessage::Text(serde_json::to_string(
-                        &crate::Message {
+                        &vec![crate::Message {
                             tag: "config".to_owned(),
                             rest: serde_json::to_value(cc)?,
                             id: None,
-                        },
+                        }],
                     )?))
                     .await?;
             }

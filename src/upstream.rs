@@ -47,12 +47,12 @@ impl crate::mainactor::UpstreamStats {
                 .await?;
             upstream
                 .send(WebsocketMessage::Text(serde_json::to_string(
-                    &ControlMessage::CursorToSpecificId(cursor),
+                    &ControlMessage::CursorToSpecificId{data:cursor},
                 )?))
                 .await?;
             upstream
                 .send(WebsocketMessage::Text(serde_json::to_string(
-                    &ControlMessage::Preroll(0),
+                    &ControlMessage::Preroll{data:0},
                 )?))
                 .await?;
             upstream
