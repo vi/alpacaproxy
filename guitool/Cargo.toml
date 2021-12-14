@@ -1,5 +1,5 @@
 [package]
-version = "0.1.0"
+version = "0.2.0"
 name = "alpacaproxy-web-console"
 authors = ["Vitaly _Vi Shukela <vi0oss@gmail.com>"]
 description = "Stand-alone GUI tool to control AlpaxaProxy's web socket"

@@ -104,11 +104,12 @@ pub struct SystemStatus {
     server_version: String,
 
     #[serde(flatten)]
+    #[allow(dead_code)]
     rest: serde_json::Value,
 }
 
 #[derive(serde_derive::Serialize, Debug)]
-#[serde(tag = "stream", content = "data")]
+#[serde(tag = "action", content = "data")]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 enum ControlMessage {
@@ -128,12 +129,12 @@ enum ControlMessage {
 }
 
 #[derive(serde_derive::Deserialize, Debug)]
-#[serde(tag = "stream", content = "data")]
+#[serde(tag = "T")]
 #[serde(rename_all = "snake_case")]
 enum ReplyMessage {
     Stats(SystemStatus),
-    Error(String),
-    Hello(UpstreamStatus),
+    Error{msg:String},
+    Hello{status:UpstreamStatus},
     Config(serde_json::Value),
 }
 
@@ -168,7 +169,7 @@ enum Msg {
 }
 
 fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
-    if ! matches! (msg, ReplyMessage::Stats(..)) {
+    if ! matches! (msg, ReplyMessage::Stats{..}) {
         log(&msg);
     }
     model.conn_status = ConnStatus::Connected;
@@ -177,7 +178,7 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
             model.allow_sending_status_inquiries = true;
             model.status = Some(x);
         }
-        ReplyMessage::Error(x) => {
+        ReplyMessage::Error{msg:x} => {
             model.allow_sending_status_inquiries = true;
             if x.contains("Supply a password first") || x.contains("Invalid password") {
                 model.conn_status = ConnStatus::Unauthenticated;
@@ -185,7 +186,7 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
                 model.errormsg = format!("Error from server: {}", x);
             }
         }
-        ReplyMessage::Hello(upstream_status) => {
+        ReplyMessage::Hello{status:upstream_status} => {
             model.status = Some(SystemStatus{
                 database_size: 0,
                 clients_connected: 0,
@@ -202,7 +203,7 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
             }
             let _ = model.ws.as_ref().unwrap().send_json(&ControlMessage::Status);
         }
-        ReplyMessage::Config(x) => {
+        ReplyMessage::Config{0:x} => {
             if let Ok(y) = serde_json::to_string_pretty(&x) {
                 model.config = y;
             } else {
@@ -284,8 +285,10 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
             model.errormsg.clear();
         }
         Msg::WsMessage(x) =>  {
-            if let Ok(t) = x.json() {
-                handle_ws_message(t, model, orders);
+            if let Ok(msgs) = x.json().map(|x:Vec<ReplyMessage>|x) {
+                for t in msgs {
+                    handle_ws_message(t, model, orders);
+                }
             } else {
                 log!("Invalid WebSocket message: {}", x.text());
             }
