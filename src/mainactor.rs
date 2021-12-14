@@ -158,7 +158,7 @@ impl UpstreamStats {
         {
             Ok(x) => x,
             Err(e) => {
-                log::error!("Failed to read config file: {}", e);
+                log::error!("Failed to read config file: {:#?}", e);
                 return;
             }
         };
@@ -176,7 +176,7 @@ impl UpstreamStats {
                     )
                     .await
                 {
-                    log::error!("Handling upstream connection existed with error: {}", e);
+                    log::error!("Handling upstream connection existed with error: {:#?}", e);
                 }
                 self.0.lock().unwrap().status = UpstreamStatus::Connecting;
                 log::info!("Finished upstream connection");

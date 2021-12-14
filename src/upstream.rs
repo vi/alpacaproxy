@@ -144,7 +144,7 @@ impl crate::mainactor::UpstreamStats {
             let mut slowdown_mode = false;
             match msg {
                 Ok(WebsocketMessage::Text(wsmsg)) => {
-                    let msgs : Vec<crate::Message> = serde_json::from_str(&wsmsg)?;
+                    let msgs : Vec<crate::Message> = serde_json::from_str(&wsmsg).with_context(||format!("Content: {}", wsmsg))?;
                     for msg in msgs {
                         let (do_yield_, slowdown_mode_) =  handle_msg(msg)?;
                         do_yield|=do_yield_;
@@ -152,7 +152,7 @@ impl crate::mainactor::UpstreamStats {
                     }
                 },
                 Ok(WebsocketMessage::Binary(wsmsg)) => {
-                    let msgs : Vec<crate::Message> = serde_json::from_slice(&wsmsg)?;
+                    let msgs : Vec<crate::Message> = serde_json::from_slice(&wsmsg).with_context(||format!("Content: {}", String::from_utf8_lossy(&wsmsg)))?;
                     for msg in msgs {
                         let (do_yield_, slowdown_mode_) =  handle_msg(msg)?;
                         do_yield|=do_yield_;

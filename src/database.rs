@@ -49,7 +49,7 @@ impl DatabaseHandle for sled::Db {
     }
 
     fn get_database_disk_size(&self) -> anyhow::Result<u64> {
-        todo!()
+        Ok(sled::Db::size_on_disk(self)?)
     }
 
     fn get_entry_by_id(&self, id: u64) -> anyhow::Result<Option<MinutelyData>> {
