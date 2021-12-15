@@ -170,7 +170,7 @@ impl crate::mainactor::UpstreamStats {
                     log::warn!("other WebSocket message from upstream");
                 }
                 Err(e) => {
-                    log::error!("From upstream websocket: {}", e);
+                    return Err(anyhow::Error::new(e).context("IO error from upstream"));
                 }
             };
             if do_yield {
