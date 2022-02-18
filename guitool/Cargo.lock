@@ -3,6 +3,19 @@
 version = 3
 
 [[package]]
+name = "alpacaproxy-viewer"
+version = "0.2.0"
+dependencies = [
+ "seed",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "size_format",
+ "timeago",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "alpacaproxy-web-console"
 version = "0.2.0"
 dependencies = [

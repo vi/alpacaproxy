@@ -1,0 +1,164 @@
+.title {
+    font-size: 20pt;
+    padding-left: 30px;
+}
+
+.websocketcontrol {
+    background: lightgray;
+}
+
+.websocketcontrol input {
+    width: 400px;
+    height: 20px;
+}
+.websocketcontrol button {
+    margin-left: 20px;
+    width: 100px;
+    height: 30px;
+}
+
+#app div div {
+    margin-top: 10px;
+    max-width: 700px;
+}
+label span {
+    display: inline-block;
+    width: 150px;
+}
+
+.passwordcontrol {
+   background: lightcyan;
+}
+.passwordcontrol .password {
+    width: 250px;
+    height: 20px;
+}
+.passwordcontrol .visiblepwd {
+    display: inline-block;
+    width: 150px;
+}
+.passwordcontrol button {
+    margin-left: 20px;
+    width: 100px;
+    height: 30px;
+}
+
+.mainactions {
+    background: lightyellow;
+    display: flex;
+    align-items: center;
+}
+.mainactions * {
+    flex-grow: 1;
+}
+.mainactions button {
+    height: 40px;
+}
+.configeditor {
+    background: #efe;
+}
+.configeditor .showconfig, .configeditor .configbuttons {
+    display: inline-block;
+    margin-bottom: 12px;
+}
+.configeditor .showconfig {
+    margin-left: 26px;
+    margin-top: 14px;
+}
+.configeditor button {
+    width: 100px;
+    height: 30px;
+    margin-left: 20px;
+}
+.configeditor div.configbuttons:after {
+    margin-left: 10px;
+    content: "(pause and restart to apply)";
+}
+.configtext {
+    display: block;
+    min-width: 680px;
+    min-height: 200px;
+}
+
+.errormsg {
+    color: red;
+    height: 30px;
+    margin-left: 30px;
+    font-family: monospace;
+}
+
+.mainstatus div {
+    display: inline-flex;
+    min-height: 36px;
+    border: solid 1px;
+    margin-left: 10px;
+    padding-left: 10px;
+    padding-top: 10px;
+    white-space: pre-wrap;
+}
+.mainstatus .connstatus {
+    width: 250px;
+}
+.mainstatus .serverstatus {
+    width: 400px;
+}
+.connstatus:before {
+    content: "Connection to server:";
+    margin-right: 10px;
+}
+.connstatus_Disconnected:after { content: "Disconnected"; }
+.connstatus_Disconnected {  background: #fcc;  }
+.connstatus_Lagging:after { content: "Lagging"; }
+.connstatus_Lagging { background: #ff8; }
+.connstatus_Connected:after { content: "Connected"; }
+.connstatus_Connected { background: #8f8; }
+.connstatus_Unauthenticated:after { content: "Passswd?"; }
+.connstatus_Unauthenticated { background: #f8f; }
+
+
+.serverstatus:before {
+    content: "Server upstream:";
+    margin-right: 10px;
+}
+.serverstatus_Connected:after { content: "Connected"; }
+.serverstatus_Connected { background: #8f8; }
+.serverstatus_ConnectedNoTU:after { content: "Idling\00000A(not received any update yet)"; }
+.serverstatus_ConnectedNoTU { background: #8ca; }
+.serverstatus_ConnectedNoRecv:after { content: "Idling\00000A(2 minutes without new data)"; }
+.serverstatus_ConnectedNoRecv { background: #8ca; }
+.serverstatus_Disabled:after { content: "Not configured"; }
+.serverstatus_Disabled {  background: #fcc;  }
+.serverstatus_Paused:after { content: "Paused"; }
+.serverstatus_Paused { background: #ccc; }
+.serverstatus_Connecting:after { content: "Connecting"; }
+.serverstatus_Connecting { background: #ff8; }
+.serverstatus_Mirroring:after { content: "Mirroring"; }
+.serverstatus_Mirroring { background: #8cf; }
+.serverstatus_MirroringNoTU:after { content: "Mirroring?\00000A(not received any update yet)"; }
+.serverstatus_MirroringNoTU { background: #8ac; }
+.serverstatus_MirroringNoRecv:after { content: "Mirroring?\00000A(2 minutes without new data)"; }
+.serverstatus_MirroringNoRecv { background: #8ac; }
+
+.showrawstatus {
+    margin-top: 20px;
+    display: block;
+}
+
+.nicestatus {
+    background: #cef;
+    border: solid 1px;
+}
+.nicestatus span {
+    margin-left: 12px;
+}
+.nicestatus div :first-child {
+    display: inline-block;
+    min-width: 150px;
+}
+.nicestatus div :nth-child(2) {
+    display: inline-block;
+    min-width: 150px;
+}
+.nicestatus .val {
+    font-weight: bold;
+}
