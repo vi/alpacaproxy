@@ -5,6 +5,7 @@
 
 .websocketcontrol {
     background: lightgray;
+    display: inline-block;
 }
 
 .websocketcontrol input {
@@ -28,6 +29,7 @@ label span {
 
 .passwordcontrol {
    background: lightcyan;
+   display: inline-block;
 }
 .passwordcontrol .password {
     width: 250px;
@@ -53,31 +55,6 @@ label span {
 }
 .mainactions button {
     height: 40px;
-}
-.configeditor {
-    background: #efe;
-}
-.configeditor .showconfig, .configeditor .configbuttons {
-    display: inline-block;
-    margin-bottom: 12px;
-}
-.configeditor .showconfig {
-    margin-left: 26px;
-    margin-top: 14px;
-}
-.configeditor button {
-    width: 100px;
-    height: 30px;
-    margin-left: 20px;
-}
-.configeditor div.configbuttons:after {
-    margin-left: 10px;
-    content: "(pause and restart to apply)";
-}
-.configtext {
-    display: block;
-    min-width: 680px;
-    min-height: 200px;
 }
 
 .errormsg {
@@ -161,4 +138,9 @@ label span {
 }
 .nicestatus .val {
     font-weight: bold;
+}
+
+#plot {
+    width: 90vw;
+    height: 70vh;
 }

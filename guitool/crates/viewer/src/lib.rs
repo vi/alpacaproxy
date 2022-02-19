@@ -36,6 +36,8 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
         password = x;
     }
 
+    initplot();
+
     orders.stream(seed::app::streams::interval(1000, ||Msg::SecondlyUpdate));
     Model { 
         wsurl,
@@ -45,6 +47,8 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
         password,
         visible_password: false,
         conn_status: ConnStatus::Disconnected,
+        ticker_filter: "SPY".to_string(),
+        preroll_size: "100000".to_string(),
     }
 }
 
@@ -61,6 +65,8 @@ struct Model {
     password: String,
     visible_password: bool,
     conn_status: ConnStatus,
+    ticker_filter: String,
+    preroll_size: String,
 }
 
 
@@ -118,6 +124,38 @@ enum ReplyMessage {
     Error{msg:String},
     Hello{status:UpstreamStatus},
     Config(serde_json::Value),
+    #[serde(rename="b")]
+    Bar(Bar),
+    PrerollFinished,
+}
+
+
+#[derive(serde_derive::Serialize, Debug)]
+struct BarForPlotting {
+    time: i64,
+    open: f32,
+    high: f32,
+    low: f32,
+    close: f32,
+    volume: f32,
+}
+
+#[derive(serde_derive::Deserialize, Debug, Clone)]
+struct Bar {
+    #[serde(rename="t", deserialize_with="time::serde::rfc3339::deserialize")]
+    datetime: time::OffsetDateTime,
+    #[serde(rename="S")]
+    ticker: String,
+    #[serde(rename="o")]
+    open: f32,
+    #[serde(rename="h")]
+    high: f32,
+    #[serde(rename="l")]
+    low: f32,
+    #[serde(rename="c")]
+    close: f32,
+    #[serde(rename="v")]
+    volume: f32,
 }
 
 // ------ ------
@@ -139,10 +177,13 @@ enum Msg {
     ToggleVisiblePassword,
     AutoConnectAndFocusPassword,
     SendPassword,
+    Plot,
+    UpdateTickerFilter(String),
+    UpdatePrerollSize(String),
 }
 
 fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Orders<Msg>) {
-    if ! matches! (msg, ReplyMessage::Stats{..}) {
+    if ! matches! (msg, ReplyMessage::Stats{..} | ReplyMessage::Bar{..}) {
         log(&msg);
     }
     model.conn_status = ConnStatus::Connected;
@@ -169,6 +210,12 @@ fn handle_ws_message(msg: ReplyMessage, model: &mut Model, _orders: &mut impl Or
         }
         ReplyMessage::Config{0:x} => {
             drop(x);
+        }
+        ReplyMessage::Bar(x) => {
+            add_bar_to_plot(&x);
+        }
+        ReplyMessage::PrerollFinished => {
+
         }
     }
 }   
@@ -268,6 +315,29 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
             }
             return update(Msg::ToggleConnectWs, model, orders);
         }
+        Msg::Plot => {
+            if let Ok(preroll) = model.preroll_size.parse() {
+                clear_plot();
+                send_ws(ControlMessage::Filter(vec![model.ticker_filter.clone()]), model, orders);
+                send_ws(ControlMessage::Preroll(preroll), model, orders);
+            } else {
+                model.errormsg = "Failed to parse preroll size".to_owned();
+            }
+            /*
+            let bar = BarForPlotting { time: 1641416197, open: 74.43, high: 120.0, low: 70.0, close: 71.0, volume: 10000.0, };
+            add_data_to_plot(wasm_bindgen::JsValue::from_serde(&bar).unwrap());
+            let bar = BarForPlotting { time: 1641416197+3600, open: 74.43, high: 110.0, low: 60.0, close: 84.0, volume: 20000.0,};
+            add_data_to_plot(wasm_bindgen::JsValue::from_serde(&bar).unwrap());
+            let bar = BarForPlotting { time: 1641416197+7200, open: 71.43, high: 130.0, low: 65.0, close: 82.0, volume: 15000.0,};
+            add_data_to_plot(wasm_bindgen::JsValue::from_serde(&bar).unwrap());
+             */
+        }
+        Msg::UpdateTickerFilter(x) => {
+            model.ticker_filter = x;
+        }
+        Msg::UpdatePrerollSize(x) => {
+            model.preroll_size = x;
+        }
     }
     html_document().set_title(match model.conn_status {
         ConnStatus::Disconnected => "WsVw: diconnected",
@@ -344,6 +414,26 @@ fn view(model: &Model) -> Node<Msg> {
             C!["errormsg"],
             &model.errormsg,
         ],
+        div![
+            C!["mainactions"],
+            
+            input![
+                C!["tickerentry"],
+                attrs!{ At::Value => model.ticker_filter, At::Type => "text" },
+                input_ev(Ev::Input, Msg::UpdateTickerFilter),
+                //keyboard_ev(Ev::KeyUp, |e| { if e.key() == "Enter" { Some(Msg::ToggleConnectWs) } else { None } }),
+            ],
+            input![
+                C!["prerollentry"],
+                attrs!{ At::Value => model.preroll_size, At::Type => "text" },
+                input_ev(Ev::Input, Msg::UpdatePrerollSize),
+                //keyboard_ev(Ev::KeyUp, |e| { if e.key() == "Enter" { Some(Msg::ToggleConnectWs) } else { None } }),
+            ],
+            button![
+                "Preroll",
+                ev(Ev::Click, |_|Msg::Plot),
+            ],
+        ],
     ]
 }
 
@@ -356,4 +446,22 @@ fn view(model: &Model) -> Node<Msg> {
 pub fn start() {
     // Mount the `app` to the element with the `id` "app".
     App::start("app", init, update, view);
+}
+
+/// ---
+/// Misc
+/// ---
+
+fn add_bar_to_plot(b: &Bar) {
+    let Bar {  open, high, low, close, volume , ..} = *b;
+    let time = b.datetime.unix_timestamp();
+    let bar = BarForPlotting { time, open, high, low, close, volume, };
+    add_data_to_plot(wasm_bindgen::JsValue::from_serde(&bar).unwrap());
+}
+
+#[wasm_bindgen]
+extern "C" {
+    fn initplot();
+    fn add_data_to_plot(val: wasm_bindgen::JsValue);
+    fn clear_plot();
 }

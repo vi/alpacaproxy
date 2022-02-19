@@ -19,6 +19,7 @@ serde = "1.0.130"
 serde_derive = "1.0.130"
 serde_json = "1.0.67"
 size_format = "1.0.2"
+time = {version="0.3.7", features=["serde-well-known","serde"]}
 timeago = { version = "0.3.0", default-features = false }
 
 [package.metadata.wasm-pack.profile.release]

@@ -5,10 +5,45 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <link data-trunk rel="css" href="style.css">
+    <link data-trunk rel="copy-file" href="lightweight-charts.standalone.production.js">
 </head>
 
 <body>
     <section id="app"></section>
+    <section id="plot"></section>
+    <script type="module" src="lightweight-charts.standalone.production.js"></script>
+    <script>
+        var price_series;
+        var volume_series;
+        function initplot() {
+            const chart = LightweightCharts.createChart(document.getElementById("plot"), { });
+            price_series = chart.addCandlestickSeries();
+            volume_series = chart.addHistogramSeries({
+                color: '#26225a80',
+                priceFormat: {
+                    type: 'volume',
+                },
+                priceScaleId: '',
+                scaleMargins: {
+                    top: 0.8,
+                    bottom: 0,
+                },
+            });
+            chart.timeScale().applyOptions({"timeVisible":true, "secondsVisible":false});
+            chart.timeScale().fitContent();
+        }
+
+        function add_data_to_plot(val) {
+            price_series.update(val);
+            let val2 = {"time":val["time"], "value":val["volume"]};
+            volume_series.update(val2);
+        }
+
+        function clear_plot() {
+            price_series.setData([]);
+            volume_series.setData([]);
+        }
+    </script>
 </body>
 
 </html>
