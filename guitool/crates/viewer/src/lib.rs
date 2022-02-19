@@ -23,8 +23,8 @@ fn init(_: Url, orders: &mut impl Orders<Msg>) -> Model {
             if durl.starts_with("http") {
                 durl = format!("ws{}",&durl[4..]);
             }
-            if durl.ends_with(".html") {
-                durl = format!("{}/ws", &durl[..(durl.len()-5)]);
+            if durl.ends_with("/viewer.html") {
+                durl = format!("{}/ws", &durl[..(durl.len()-12)]);
                 wsurl = durl;
             }
         }
