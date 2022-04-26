@@ -1,7 +1,8 @@
-use std::{convert::TryInto, sync::{Arc, Mutex}, time::Duration};
+use std::{convert::TryInto, sync::{Arc, Mutex}, time::Duration, iter::FromIterator};
 
 use anyhow::Context;
 
+use bincode::Options;
 use serde_derive::{Serialize, Deserialize};
 
 const INDEX_ENTRIES : usize = 1024;
@@ -27,8 +28,13 @@ pub trait DatabaseHandle : Send + Sync {
     fn get_entry_by_id(&self, id: u64) -> anyhow::Result<Option<MinutelyData>>;
     fn insert_entry(&self, id: u64, entry: &MinutelyData) -> anyhow::Result<()>;
     fn remove_entry(&self, id: u64) -> anyhow::Result<bool>;
+    fn get_filtered_reader(&self, filter: &hashbrown::HashSet<smol_str::SmolStr>) -> Option<Box<dyn Send + FilteredDatabaseReader>>;
 }
 pub type Db = std::sync::Arc<dyn DatabaseHandle>;
+
+pub trait FilteredDatabaseReader {
+    fn get_entry_by_id_if_matches(&mut self, id: u64) -> anyhow::Result<Option<MinutelyData>>;
+}
 
 const INDEX_TREE_NAME : &'static [u8] = b"index";
 pub fn open_sled(db: sled::Db) -> anyhow::Result<Db> {
@@ -43,6 +49,14 @@ struct SledDb {
     root: sled::Db,
     index: sled::Tree,
     pending_index_entries: Mutex<Vec<IndexEntry>>,
+}
+
+struct SledFilteredReader {
+    filter: hashbrown::HashSet<TrimmedTickerName>,
+    root: sled::Db,
+    index: sled::Tree,
+    current_filter_entry : Option<(IndexHeader, hashbrown::HashMap<u64, TrimmedTickerName>)>,
+    index_is_stale: bool,
 }
 
 const TRIMMED_TICKER_NAME_LEN : usize = 4;
@@ -115,8 +129,7 @@ impl DatabaseHandle for SledDb {
 
         if let Some((header, data)) = to_insert_to_index {
             log::debug!("Inserting to index entries {}..{}", header.first_key, header.last_key_plus_1);
-            use bincode::Options;
-            let header = bincode::DefaultOptions::new().with_big_endian().with_fixint_encoding().serialize(&header)?;
+            let header = bco().serialize(&header)?;
             self.index.insert(header, data)?;
         }
 
@@ -125,6 +138,68 @@ impl DatabaseHandle for SledDb {
 
     fn remove_entry(&self, id: u64) -> anyhow::Result<bool> {
         Ok(self.root.remove(id.to_be_bytes())?.is_some())
+    }
+
+    fn get_filtered_reader(&self, filter: &hashbrown::HashSet<smol_str::SmolStr>) -> Option<Box<dyn Send + FilteredDatabaseReader>> {
+        Some(Box::new(SledFilteredReader {
+            filter : hashbrown::HashSet::from_iter(filter.iter().map(|x|trim_ticker(x.as_str()))),
+            current_filter_entry: None,
+            root: self.root.clone(),
+            index: self.index.clone(),
+            index_is_stale: false,
+        }))
+    }
+}
+
+fn bco() -> impl bincode::Options {
+    bincode::DefaultOptions::new().with_big_endian().with_fixint_encoding()
+}
+
+impl FilteredDatabaseReader for SledFilteredReader {
+    fn get_entry_by_id_if_matches(&mut self, id: u64) -> anyhow::Result<Option<MinutelyData>> {
+        if let Some(ref e) = self.current_filter_entry {
+            if e.0.first_key >= id && e.0.last_key_plus_1 < id {
+                // OK, this is a valid entry
+            } else {
+                self.current_filter_entry = None;
+            }
+        }
+        if self.current_filter_entry.is_none() && !self.index_is_stale {
+            let ih: IndexHeader = IndexHeader {
+                first_key: id,
+                last_key_plus_1: u64::MAX,
+            };
+            let ih = bco().serialize(&ih)?;
+            if let Some((ie_h, ie_data)) = self.index.get_lt(ih)? {
+                let ih : IndexHeader = bco().deserialize(&ie_h.to_vec())?;
+                if ih.first_key >= id && ih.last_key_plus_1 < id {
+                    // OK, this is a valid entry
+                    let mut map : hashbrown::HashMap<u64, TrimmedTickerName> = hashbrown::HashMap::with_capacity(INDEX_ENTRIES);
+                    for (i,chunk) in ie_data.chunks_exact(TRIMMED_TICKER_NAME_LEN).enumerate() {
+                        let nam : [u8; TRIMMED_TICKER_NAME_LEN] = chunk.try_into().unwrap();
+                        map.insert(ih.first_key + i as u64, nam);
+                    }
+                    self.current_filter_entry=Some((ih, map));
+                } else {
+                    self.index_is_stale = true;
+                }
+            } else {
+                self.index_is_stale = true;
+            }
+        }
+        if let Some(ref cfe) = self.current_filter_entry {
+            if ! self.filter.contains(&cfe.1[&id]) {
+                return Ok(None);
+            }
+        } 
+        // unconditionally let the item though.
+        // The code in `client.rs` should provide additional filtering anyway
+        Ok(
+            match self.root.get(id.to_be_bytes())? {
+                Some(v) => serde_json::from_slice(&v)?,
+                None => None,
+            }
+        )
     }
 }
 
@@ -192,8 +267,7 @@ pub async fn database_capper(
                     let index = db.open_tree(INDEX_TREE_NAME)?;
                     for index_entry in index.iter() {
                         let (index_key, _) = index_entry?;
-                        use bincode::Options;
-                        let range : IndexHeader = bincode::DefaultOptions::new().with_big_endian().with_fixint_encoding().deserialize(&index_key.to_vec())?;
+                        let range : IndexHeader = bco().deserialize(&index_key.to_vec())?;
                         if range.last_key_plus_1 <= first_remaining_key {
                             index.remove(index_key)?;
                         } else {
