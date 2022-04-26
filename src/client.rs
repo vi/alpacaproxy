@@ -207,8 +207,12 @@ impl ServeClient {
         match msg {
             ControlMessage::Preroll{data:num} => {
                 let cursor = self.get_cursor().await?;
-                let start = cursor.saturating_sub(num);
-                let rangeend = self.db.get_first_last_id()?.1.unwrap_or(cursor);
+                let mut start = cursor.saturating_sub(num);
+                let (first,last) = self.db.get_first_last_id()?;
+                if let Some(first) = first {
+                    start = start.max(first);
+                }
+                let rangeend = last.unwrap_or(cursor);
                 let range = start..=rangeend;
                 log::info!(
                     "  prerolling {} messages for the client, really {}",
