@@ -1,9 +1,13 @@
-use std::{convert::TryInto, sync::Arc, time::Duration};
+use std::{convert::TryInto, sync::{Arc, Mutex}, time::Duration};
 
 use anyhow::Context;
 
+use serde_derive::{Serialize, Deserialize};
+
+const INDEX_ENTRIES : usize = 1024;
+
 // {'T': 'b', 'S': 'TXN', 'o': 193.24, 'c': 193.24, 'h': 193.24, 'l': 193.24, 'v': 977, 't': '2021-12-13T21:04:00Z', 'n': 2, 'vw': 193.238219}
-#[derive(serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MinutelyData {
     #[serde(rename = "S")]
     pub ticker: String,
@@ -27,12 +31,37 @@ pub trait DatabaseHandle : Send + Sync {
 pub type Db = std::sync::Arc<dyn DatabaseHandle>;
 
 pub fn open_sled(db: sled::Db) -> anyhow::Result<Db> {
-    Ok(Arc::new(db))
+    Ok(Arc::new(SledDb{
+        index: db.open_tree(b"index")?,
+        root: db,
+        pending_index_entries: Mutex::new(Vec::with_capacity(INDEX_ENTRIES)),
+    }))
 }
 
-impl DatabaseHandle for sled::Db {
+struct SledDb {
+    root: sled::Db,
+    index: sled::Tree,
+    pending_index_entries: Mutex<Vec<IndexEntry>>,
+}
+
+const TRIMMED_TICKER_NAME_LEN : usize = 8;
+type TrimmedTickerName = [u8; TRIMMED_TICKER_NAME_LEN];
+
+
+struct IndexEntry {
+    key: u64,
+    nam: TrimmedTickerName,
+}
+
+#[derive(Serialize,Deserialize)]
+struct IndexHeader {
+    first_key: u64,
+    last_key_plus_1: u64,
+}
+
+impl DatabaseHandle for SledDb {
     fn get_next_db_key(&self) -> anyhow::Result<u64> {
-        let nextkey = match self.last()? {
+        let nextkey = match self.root.last()? {
             None => 0,
             Some((k, _v)) => {
                 let k: [u8; 8] = k.as_ref().try_into()?;
@@ -45,16 +74,16 @@ impl DatabaseHandle for sled::Db {
     }
 
     fn get_first_last_id(&self) -> anyhow::Result<(Option<u64>, Option<u64>)> {
-        get_first_last_id(self)
+        get_first_last_id(&self.root)
     }
 
     fn get_database_disk_size(&self) -> anyhow::Result<u64> {
-        Ok(sled::Db::size_on_disk(self)?)
+        Ok(sled::Db::size_on_disk(&self.root)?)
     }
 
     fn get_entry_by_id(&self, id: u64) -> anyhow::Result<Option<MinutelyData>> {
         Ok(
-            match self.get(id.to_be_bytes())? {
+            match self.root.get(id.to_be_bytes())? {
                 Some(v) => serde_json::from_slice(&v)?,
                 None => None,
             }
@@ -62,13 +91,48 @@ impl DatabaseHandle for sled::Db {
     }
 
     fn insert_entry(&self, id: u64, entry: &MinutelyData) -> anyhow::Result<()> {
-        self.insert(id.to_be_bytes(), serde_json::to_vec(&entry)?)?;
+        self.root.insert(id.to_be_bytes(), serde_json::to_vec(&entry)?)?;
+
+        let mut to_insert_to_index = None;
+        let mut pe = self.pending_index_entries.lock().unwrap();
+        pe.push(IndexEntry{key: id, nam: trim_ticker(&entry.ticker)});
+        if pe.len() >= INDEX_ENTRIES {
+            let ih = IndexHeader {
+                first_key: pe[0].key,
+                last_key_plus_1: pe.last().unwrap().key + 1,
+            };
+            let mut data = vec![0u8; TRIMMED_TICKER_NAME_LEN*(ih.last_key_plus_1 - ih.first_key) as usize];
+            for IndexEntry { key, nam } in pe.drain(..) {
+                if let Some(index) = key.checked_sub(ih.first_key) {
+                    let index = index as usize * TRIMMED_TICKER_NAME_LEN;
+                    data[index..(index+TRIMMED_TICKER_NAME_LEN)].copy_from_slice(&nam);
+                }
+            }
+            to_insert_to_index = Some((ih, data));
+        }
+        drop(pe);
+
+        if let Some((header, data)) = to_insert_to_index {
+            log::debug!("Inserting to index entries {}..{}", header.first_key, header.last_key_plus_1);
+            use bincode::Options;
+            let header = bincode::DefaultOptions::new().with_big_endian().with_fixint_encoding().serialize(&header)?;
+            self.index.insert(header, data)?;
+        }
+
         Ok(())
     }
 
     fn remove_entry(&self, id: u64) -> anyhow::Result<bool> {
-        Ok(self.remove(id.to_be_bytes())?.is_some())
+        Ok(self.root.remove(id.to_be_bytes())?.is_some())
     }
+}
+
+fn trim_ticker(ticker: &str) -> TrimmedTickerName {
+    let mut ret = [0u8; TRIMMED_TICKER_NAME_LEN];
+    let b = ticker.as_bytes();
+    let cap = b.len().min(TRIMMED_TICKER_NAME_LEN);
+    ret[..cap].copy_from_slice(&b[..cap]);
+    ret
 }
 
 fn get_first_last_id(db : &sled::Db) -> anyhow::Result<(Option<u64>, Option<u64>)> {

@@ -8,6 +8,7 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0.43"
 argh = "0.1.6"
+bincode = "1.3.3"
 chrono = "0.4.19"
 env_logger = {version="0.9.0", default_features=false}
 futures = "0.3.17"
