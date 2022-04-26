@@ -30,9 +30,10 @@ pub trait DatabaseHandle : Send + Sync {
 }
 pub type Db = std::sync::Arc<dyn DatabaseHandle>;
 
+const INDEX_TREE_NAME : &'static [u8] = b"index";
 pub fn open_sled(db: sled::Db) -> anyhow::Result<Db> {
     Ok(Arc::new(SledDb{
-        index: db.open_tree(b"index")?,
+        index: db.open_tree(INDEX_TREE_NAME)?,
         root: db,
         pending_index_entries: Mutex::new(Vec::with_capacity(INDEX_ENTRIES)),
     }))
@@ -181,6 +182,27 @@ pub async fn database_capper(
                     tokio::task::yield_now().await;
                 }
             }
+
+            // Now clear stale index entries
+            match db.first()? {
+                None => (),
+                Some((k, _v)) => {
+                    let k: [u8; 8] = k.as_ref().try_into()?;
+                    let first_remaining_key = u64::from_be_bytes(k);
+                    let index = db.open_tree(INDEX_TREE_NAME)?;
+                    for index_entry in index.iter() {
+                        let (index_key, _) = index_entry?;
+                        use bincode::Options;
+                        let range : IndexHeader = bincode::DefaultOptions::new().with_big_endian().with_fixint_encoding().deserialize(&index_key.to_vec())?;
+                        if range.last_key_plus_1 <= first_remaining_key {
+                            index.remove(index_key)?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            };
+
             let _ = db.flush_async().await;
             log::debug!("Trimmer run finished");
             tokio::time::sleep(Duration::new(database_size_checkup_interval_secs, 0)).await;
