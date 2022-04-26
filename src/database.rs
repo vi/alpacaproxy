@@ -45,7 +45,7 @@ struct SledDb {
     pending_index_entries: Mutex<Vec<IndexEntry>>,
 }
 
-const TRIMMED_TICKER_NAME_LEN : usize = 8;
+const TRIMMED_TICKER_NAME_LEN : usize = 4;
 type TrimmedTickerName = [u8; TRIMMED_TICKER_NAME_LEN];
 
 
