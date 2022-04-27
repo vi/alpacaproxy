@@ -191,6 +191,9 @@ impl ServeClient {
             if let Some(mut fr) = self.db.get_filtered_reader(filter) {
                 log::debug!("Obtained a indexed/filtered reader");
                 for x in range {
+                    if x % 2000 == 0 {
+                        tokio::task::yield_now().await;
+                    }
                     let x: u64 = x;
                     if let Some(v) = fr.get_entry_by_id_if_matches(x)? {
                         self.datum(v, x).await?;
@@ -203,6 +206,9 @@ impl ServeClient {
         }
         for x in range {
             let x: u64 = x;
+            if x % 2000 == 0 {
+                tokio::task::yield_now().await;
+            }
             match self.db.get_entry_by_id(x)? {
                 Some(v) => {
                     self.datum(v, x).await?;
