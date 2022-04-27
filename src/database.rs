@@ -56,7 +56,7 @@ struct SledFilteredReader {
     root: sled::Db,
     index: sled::Tree,
     current_filter_entry : Option<(IndexHeader, hashbrown::HashMap<u64, TrimmedTickerName>)>,
-    index_is_stale: bool,
+    index_is_stale_until: Option<u64>,
 }
 
 const TRIMMED_TICKER_NAME_LEN : usize = 4;
@@ -68,7 +68,7 @@ struct IndexEntry {
     nam: TrimmedTickerName,
 }
 
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize,Deserialize,Clone, Copy)]
 struct IndexHeader {
     first_key: u64,
     last_key_plus_1: u64,
@@ -146,7 +146,7 @@ impl DatabaseHandle for SledDb {
             current_filter_entry: None,
             root: self.root.clone(),
             index: self.index.clone(),
-            index_is_stale: false,
+            index_is_stale_until: None,
         }))
     }
 }
@@ -158,13 +158,21 @@ fn bco() -> impl bincode::Options {
 impl FilteredDatabaseReader for SledFilteredReader {
     fn get_entry_by_id_if_matches(&mut self, id: u64) -> anyhow::Result<Option<MinutelyData>> {
         if let Some(ref e) = self.current_filter_entry {
-            if e.0.first_key >= id && e.0.last_key_plus_1 < id {
+            if e.0.first_key <= id && e.0.last_key_plus_1 > id {
                 // OK, this is a valid entry
+                log::trace!("Index page is already OK");
             } else {
+                log::trace!("Index page gets invalidated");
                 self.current_filter_entry = None;
             }
         }
-        if self.current_filter_entry.is_none() && !self.index_is_stale {
+        if let Some(isu) = self.index_is_stale_until {
+            if id > isu {
+                self.index_is_stale_until = None;
+                log::debug!("Resetting index stale status");
+            }
+        }
+        if self.current_filter_entry.is_none() && self.index_is_stale_until.is_none() {
             let ih: IndexHeader = IndexHeader {
                 first_key: id,
                 last_key_plus_1: u64::MAX,
@@ -172,7 +180,7 @@ impl FilteredDatabaseReader for SledFilteredReader {
             let ih = bco().serialize(&ih)?;
             if let Some((ie_h, ie_data)) = self.index.get_lt(ih)? {
                 let ih : IndexHeader = bco().deserialize(&ie_h.to_vec())?;
-                if ih.first_key >= id && ih.last_key_plus_1 < id {
+                if ih.first_key <= id && ih.last_key_plus_1 > id {
                     // OK, this is a valid entry
                     let mut map : hashbrown::HashMap<u64, TrimmedTickerName> = hashbrown::HashMap::with_capacity(INDEX_ENTRIES);
                     for (i,chunk) in ie_data.chunks_exact(TRIMMED_TICKER_NAME_LEN).enumerate() {
@@ -180,16 +188,22 @@ impl FilteredDatabaseReader for SledFilteredReader {
                         map.insert(ih.first_key + i as u64, nam);
                     }
                     self.current_filter_entry=Some((ih, map));
+                    log::debug!("Loaded index page {}..{}", ih.first_key, ih.last_key_plus_1);
                 } else {
-                    self.index_is_stale = true;
+                    log::debug!("Index is marked as stale - wrong id. id={} not in {}..{}", id, ih.first_key, ih.last_key_plus_1);
+                    self.index_is_stale_until = Some(id + INDEX_ENTRIES as u64 / 2);
                 }
             } else {
-                self.index_is_stale = true;
+                log::debug!("Index is marked as stale - not found for id={}", id);
+                self.index_is_stale_until = Some(id + INDEX_ENTRIES as u64 / 2);
             }
         }
         if let Some(ref cfe) = self.current_filter_entry {
             if ! self.filter.contains(&cfe.1[&id]) {
+                log::trace!("{}({}) does not match filter", id, String::from_utf8_lossy(&cfe.1[&id]));
                 return Ok(None);
+            } else {
+                log::trace!("{}({}) does matches the filter", id, String::from_utf8_lossy(&cfe.1[&id]));
             }
         } 
         // unconditionally let the item though.

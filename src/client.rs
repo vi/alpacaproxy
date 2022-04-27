@@ -187,6 +187,20 @@ impl ServeClient {
     }
 
     async fn preroller(&mut self, range: impl Iterator<Item = u64>) -> anyhow::Result<()> {
+        if let Some(ref filter) = self.filter {
+            if let Some(mut fr) = self.db.get_filtered_reader(filter) {
+                log::debug!("Obtained a indexed/filtered reader");
+                for x in range {
+                    let x: u64 = x;
+                    if let Some(v) = fr.get_entry_by_id_if_matches(x)? {
+                        self.datum(v, x).await?;
+                    }
+                }
+                return Ok(());
+            } else {
+                log::debug!("Failed to obtain indexed/filtered reader");
+            }
+        }
         for x in range {
             let x: u64 = x;
             match self.db.get_entry_by_id(x)? {
