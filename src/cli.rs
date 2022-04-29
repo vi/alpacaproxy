@@ -30,7 +30,7 @@ pub struct Serve {
     #[argh(option, short = 'L')]
     pub max_database_size: Option<u64>,
 
-    /// satabase size scanning interval
+    /// database size scanning interval
     #[argh(option, default = "60")]
     pub database_size_checkup_interval_secs: u64,
 
@@ -39,6 +39,10 @@ pub struct Serve {
 
     #[argh(positional)]
     pub listen_addr: SocketAddr,
+
+    /// expose Prometheus metris over this socket
+    #[argh(option)]
+    pub prometheus: Option<SocketAddr>,
 } 
 
 /// Check for missing minutes and report
@@ -69,8 +73,13 @@ pub fn main() -> anyhow::Result<()> {
 
     match opts.cmd {
         Cmd::Serve(servopts) => {
+            let startt = std::time::Instant::now();
             let first_config = crate::config::read_config(&servopts.client_config)?;
             log::debug!("Checked config file");
+
+            if let Some(prometheus_addr) = servopts.prometheus {
+                prometheus_exporter::start(prometheus_addr)?;
+            }
 
             let sled_db = opendb(&opts.database)?;
 
@@ -123,6 +132,8 @@ pub fn main() -> anyhow::Result<()> {
                 }
             });
 
+            let boottime = std::time::Instant::now().duration_since(startt);
+            crate::METRICS.boottime.set(boottime.as_secs_f64());
             let ret = rt.block_on(crate::mainactor::main_actor(
                 servopts.client_config,
                 &db,
