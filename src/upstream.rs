@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use tokio_tungstenite::tungstenite::Message as WebsocketMessage;
 
-use crate::mainactor::UpstreamStatus;
+use crate::{mainactor::UpstreamStatus, metrics::guarded::GuardedGauge};
 
 impl crate::mainactor::UpstreamStats {
     pub async fn handle_upstream(
@@ -25,6 +25,7 @@ impl crate::mainactor::UpstreamStats {
         watcher_tx: UnboundedSender<u64>,
     ) -> anyhow::Result<()> {
         log::debug!("Establishing upstream connection 1");
+        crate::METRICS.upstream_connect_starts.inc();
         let (mut upstream, _) = tokio_tungstenite::connect_async(uri).await?;
         log::debug!("Establishing upstream connection 2");
         for startup_msg in startup_messages {
@@ -62,6 +63,9 @@ impl crate::mainactor::UpstreamStats {
                 .await?;
         }
         log::debug!("Establishing upstream connection 3");
+        crate::METRICS.upstream_connect_ws.inc();
+        let _g = crate::METRICS.upstream_is_connected.guarded_add(1);
+        let _g2 = crate::METRICS.upstream_session_durations.start_timer();
 
         let mut nextkey = db.get_next_db_key()?;
         let mut slowdown_mode = false;
@@ -77,11 +81,13 @@ impl crate::mainactor::UpstreamStats {
                 "subscription" => {
                     log::info!("Established upstream connection");
                     self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                    crate::METRICS.upstream_connect_auth.inc();
                 }
                 "preroll_finished" => {
                     log::debug!("Received 'preroll_finished' response");
                     if automirror {
                         self.0.lock().unwrap().status = UpstreamStatus::Connected;
+                        crate::METRICS.upstream_connect_auth.inc();
                         log::info!("Finished updating the mirror");
                     }
                 }
@@ -94,6 +100,8 @@ impl crate::mainactor::UpstreamStats {
                 "b" => {
                     let val : crate::database::MinutelyData = serde_json::from_value(msg.rest)?;
                     log::debug!("Received minutely update for {}", val.ticker);
+                    crate::METRICS.entries_received_from_upstream.inc();
+                    let _g = crate::METRICS.upstream_processing_durations.start_timer();
                     let mut do_yield = false;
                     let mut do_consider_db_size = false;
                     {
@@ -115,11 +123,13 @@ impl crate::mainactor::UpstreamStats {
                                     "Slowing down reading from upstream due to database overflow"
                                 );
                                 slowdown_mode = true;
+                                crate::METRICS.slowdown_mode_enters.inc();
                             } else {
                                 if slowdown_mode {
                                     log::info!("No longer slowing down reads");
                                 }
                                 slowdown_mode = false;
+                                crate::METRICS.slowdown_mode_exits.inc();
                             }
                         }
                     }
@@ -139,7 +149,10 @@ impl crate::mainactor::UpstreamStats {
             Ok((false, slowdown_mode))
         };
 
+        let mut _timer = None;
         while let Some(msg) = upstream.next().await {
+            crate::METRICS.upstream_websocket_events.inc();
+            _timer = Some(crate::METRICS.upstream_lull_durations.start_timer());
             let mut do_yield = false;
             let mut slowdown_mode = false;
             match msg {

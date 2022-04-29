@@ -81,7 +81,7 @@ pub fn main() -> anyhow::Result<()> {
                 prometheus_exporter::start(prometheus_addr)?;
             }
 
-            let sled_db = opendb(&opts.database)?;
+            let sled_db: sled::Db = opendb(&opts.database)?;
 
             log::debug!("Opened the database");
 
@@ -131,6 +131,10 @@ pub fn main() -> anyhow::Result<()> {
                     log::error!("Socket listener: {}", e);
                 }
             });
+
+            if servopts.prometheus.is_some() {
+                rt.spawn(crate::metrics::periodic_poller(db.clone()));
+            }
 
             let boottime = std::time::Instant::now().duration_since(startt);
             crate::METRICS.boottime.set(boottime.as_secs_f64());

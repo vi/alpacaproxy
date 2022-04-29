@@ -15,18 +15,18 @@ use tokio::sync::{
 #[serde(tag = "action")]
 #[serde(rename_all = "snake_case")]
 pub enum ControlMessage {
-    Preroll{data:u64},
+    Preroll { data: u64 },
     Monitor,
-    Filter{data:Vec<String>},
-    RemoveRetainingLastN{data:u64},
+    Filter { data: Vec<String> },
+    RemoveRetainingLastN { data: u64 },
     DatabaseSize,
     Status,
     Shutdown,
     PauseUpstream,
     ResumeUpstream,
-    CursorToSpecificId{data:u64},
-    Password{data:String},
-    WriteConfig{data:crate::config::ClientConfig},
+    CursorToSpecificId { data: u64 },
+    Password { data: String },
+    WriteConfig { data: crate::config::ClientConfig },
     ReadConfig,
     PleaseIncludeIds,
 }
@@ -40,6 +40,7 @@ struct ServeClient {
     require_password: Option<String>,
     db_watcher: WatchReceiver<u64>,
     include_ids: bool,
+    now_streaming: bool,
 }
 
 async fn serve_client(
@@ -60,8 +61,10 @@ async fn serve_client(
         require_password,
         db_watcher,
         include_ids: false,
+        now_streaming: false,
     };
     let _ = cc2.send(ConsoleControl::ClientConnected);
+    let _g = crate::METRICS.client_session_durations.start_timer();
     let ret = c.run().await;
     let _ = cc2.send(ConsoleControl::ClientDisconnected);
     ret
@@ -180,6 +183,14 @@ impl ServeClient {
             rest: serde_json::to_value(minutely)?,
             id: if self.include_ids { Some(id) } else { None },
         };
+
+        let _g = if self.now_streaming {
+            crate::METRICS.entries_streamed_to_clients.inc();
+            crate::METRICS.client_backpressure_stream.start_timer()
+        } else {
+            crate::METRICS.entries_prerolled_to_clients.inc();
+            crate::METRICS.client_backpressure_preroll.start_timer()
+        };
         self.ws
             .send(WebsocketMessage::Text(serde_json::to_string(&vec![msg])?))
             .await?;
@@ -220,15 +231,15 @@ impl ServeClient {
     }
 
     async fn handle_msg(&mut self, msg: ControlMessage) -> anyhow::Result<()> {
-        if self.require_password.is_some() && !matches!(msg, ControlMessage::Password{..}) {
+        if self.require_password.is_some() && !matches!(msg, ControlMessage::Password { .. }) {
             self.err("Supply a password first".to_owned()).await?;
             return Ok(());
         }
         match msg {
-            ControlMessage::Preroll{data:num} => {
+            ControlMessage::Preroll { data: num } => {
                 let cursor = self.get_cursor().await?;
                 let mut start = cursor.saturating_sub(num);
-                let (first,last) = self.db.get_first_last_id()?;
+                let (first, last) = self.db.get_first_last_id()?;
                 if let Some(first) = first {
                     start = start.max(first);
                 }
@@ -239,6 +250,8 @@ impl ServeClient {
                     num,
                     rangeend + 1 - start
                 );
+                crate::METRICS.client_preroll_commands.inc();
+                let _g = crate::METRICS.preroll_durations.start_timer();
                 self.preroller(range).await?;
                 {
                     let buf = serde_json::to_string(&vec![crate::Message {
@@ -255,6 +268,8 @@ impl ServeClient {
             ControlMessage::Monitor => {
                 let _ = self.get_cursor().await?;
                 log::info!("  streaming messages for the client");
+                crate::METRICS.client_monitor_comands.inc();
+                self.now_streaming = true;
 
                 loop {
                     self.db_watcher.changed().await?;
@@ -268,7 +283,7 @@ impl ServeClient {
                     }
                 }
             }
-            ControlMessage::RemoveRetainingLastN{data:num} => {
+            ControlMessage::RemoveRetainingLastN { data: num } => {
                 log::info!("  retaining {} last samples in the database", num);
                 let first = self.db.get_first_last_id()?.0.unwrap_or(0);
                 let cursor = self.get_cursor().await?;
@@ -304,21 +319,22 @@ impl ServeClient {
                 .unwrap();
                 self.ws.send(WebsocketMessage::Text(buf)).await?;
             }
-            ControlMessage::Filter{data:a} => {
+            ControlMessage::Filter { data: a } => {
                 self.filter = Some(a.into_iter().map(smol_str::SmolStr::new).collect());
             }
             ControlMessage::Status => {
+                crate::METRICS.client_status_queries.inc();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.console_control.send(ConsoleControl::Status(tx))?;
                 let ss = rx.await?;
                 self.ws
-                    .send(WebsocketMessage::Text(serde_json::to_string(
-                        &vec![crate::Message {
+                    .send(WebsocketMessage::Text(serde_json::to_string(&vec![
+                        crate::Message {
                             tag: "stats".to_owned(),
                             rest: serde_json::to_value(ss)?,
                             id: None,
-                        }],
-                    )?))
+                        },
+                    ])?))
                     .await?;
             }
             ControlMessage::Shutdown => self.console_control.send(ConsoleControl::Shutdown)?,
@@ -328,13 +344,16 @@ impl ServeClient {
             ControlMessage::ResumeUpstream => {
                 self.console_control.send(ConsoleControl::ResumeUpstream)?
             }
-            ControlMessage::CursorToSpecificId{data:newid} => {
+            ControlMessage::CursorToSpecificId { data: newid } => {
                 log::info!("  explicit cursor set to {}", newid);
                 self.cursor = Some(newid);
             }
-            ControlMessage::Password{data:supplied_password} => {
+            ControlMessage::Password {
+                data: supplied_password,
+            } => {
                 if let Some(required_password) = self.require_password.take() {
                     if required_password != supplied_password {
+                        crate::METRICS.client_invalid_password.inc();
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         self.err("Invalid password".to_owned()).await?;
                         self.require_password = Some(required_password);
@@ -345,21 +364,24 @@ impl ServeClient {
                     self.err("No password required".to_owned()).await?;
                 }
             }
-            ControlMessage::WriteConfig{data:new_config} => self
-                .console_control
-                .send(ConsoleControl::WriteConfig(new_config))?,
+            ControlMessage::WriteConfig { data: new_config } => {
+                crate::METRICS.client_settings_writes.inc();
+                self.console_control
+                    .send(ConsoleControl::WriteConfig(new_config))?
+            }
             ControlMessage::ReadConfig => {
+                crate::METRICS.client_settings_reads.inc();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.console_control.send(ConsoleControl::ReadConfig(tx))?;
                 let cc = rx.await?;
                 self.ws
-                    .send(WebsocketMessage::Text(serde_json::to_string(
-                        &vec![crate::Message {
+                    .send(WebsocketMessage::Text(serde_json::to_string(&vec![
+                        crate::Message {
                             tag: "config".to_owned(),
                             rest: serde_json::to_value(cc)?,
                             id: None,
-                        }],
-                    )?))
+                        },
+                    ])?))
                     .await?;
             }
             ControlMessage::PleaseIncludeIds => {
@@ -390,6 +412,9 @@ pub async fn socket_listener(
                 let require_password = require_password.clone();
                 let db_watcher = watcher_rx.clone();
                 tokio::spawn(async move {
+                    use crate::metrics::guarded::GuardedGauge;
+                    crate::METRICS.client_connects.inc();
+                    let _g = crate::METRICS.clients_connected.guarded_inc();
                     if let Err(e) =
                         serve_client(client_socket, &db__, consctrl, require_password, db_watcher)
                             .await
